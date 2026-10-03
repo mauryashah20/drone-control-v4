@@ -1,0 +1,52 @@
+# Android & Gradle
+.gradle/
+.kotlin/
+**/.kotlin/
+build/
+**/build/
+*.iml
+**/*.iml
+.idea/
+**/.idea/
+local.properties
+**/local.properties
+.externalNativeBuild/
+**/.externalNativeBuild/
+.cxx/
+**/.cxx/
+captures/
+**/captures/
+*.apk
+*.aab
+
+# PlatformIO & Embedded
+.pio/
+**/.pio/
+.pioenvs/
+.piolibdeps/
+.clangd/
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+.pytest_cache/
+
+# OS and Editor
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.vscode/
+**/.vscode/

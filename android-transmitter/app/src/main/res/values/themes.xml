@@ -1,0 +1,14 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <style name="Base.Theme.UdpAndroidAppTransmitter" parent="Theme.Material3.Dark.NoActionBar">
+        <!-- Luxury Supercar Hacker Theme -->
+        <item name="android:windowBackground">@color/black_pitch</item>
+        <item name="android:statusBarColor">@color/black_pitch</item>
+        <item name="android:navigationBarColor">@color/black_pitch</item>
+        <item name="colorPrimary">@color/gold_bright</item>
+        <item name="colorSecondary">@color/neon_green</item>
+        <item name="colorSurface">@color/black_carbon</item>
+    </style>
+
+    <style name="Theme.UdpAndroidAppTransmitter" parent="Base.Theme.UdpAndroidAppTransmitter" />
+</resources>

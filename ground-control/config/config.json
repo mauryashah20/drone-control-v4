@@ -1,0 +1,112 @@
+{
+  "project": {
+    "title": "UDP Video Receiver Dashboard",
+    "description": "Windows application to receive, decode, and render live video stream over UDP. Dashboard for control and diagnostics.",
+    "platform": "windows",
+    "language": "python",
+    "framework": "PyQt5"
+  },
+  "ui": {
+    "main_window": {
+      "layout": "horizontal_split",
+      "left_panel": {
+        "type": "Dashboard",
+        "initial_options": [
+          {
+            "type": "Label",
+            "id": "dashboard_label",
+            "text": "Control & Diagnostics"
+          },
+          {
+            "type": "Button",
+            "id": "start_button",
+            "label": "Start Receiving",
+            "on_click": "startReceiving"
+          },
+          {
+            "type": "Button",
+            "id": "stop_button",
+            "label": "Stop Receiving",
+            "on_click": "stopReceiving"
+          },
+          {
+            "type": "Label",
+            "id": "status_label",
+            "text": "Status: Idle"
+          },
+          {
+            "type": "TextBox",
+            "id": "log_box",
+            "label": "Log Output",
+            "multiline": true,
+            "readonly": true,
+            "height": 120
+          }
+        ]
+      },
+      "right_panel": {
+        "type": "VideoDisplay",
+        "id": "video_screen",
+        "label": "Live Video Feed",
+        "size": "expand"
+      }
+    }
+  },
+  "network": {
+    "protocol": "UDP",
+    "local_ip": "192.168.191.187",
+    "local_port": 5005,
+    "remote_ip": "192.168.191.188",
+    "remote_port": 5005,
+    "buffer_bytes": 2048,
+    "socket_options": {
+      "reuse_address": true,
+      "so_timeout": 100,
+      "pin_interface": true
+    }
+  },
+  "video_decode": {
+    "codec": "H.264",
+    "resolution": "640x480",
+    "use_opencv": true,
+    "display_window": "video_screen",
+    "background_thread": true
+  },
+  "logic": {
+    "startReceiving": [
+      "initialize UDP socket, bind to local_ip/local_port",
+      "start background thread to receive frames",
+      "decode and show frames in video_screen",
+      "log receipt metadata: source ip, sequence, timestamp",
+      "change status_label to 'Receiving'"
+    ],
+    "stopReceiving": [
+      "stop receiver thread, close socket",
+      "change status_label to 'Idle'"
+    ]
+  },
+  "diagnostics": {
+    "packet_stats": true,
+    "frame_rate_measurement": true,
+    "sequence_loss_detection": true,
+    "rtt_echo_reply": true
+  },
+  "security": {
+    "source_ip_validation": true,
+    "pre_shared_token": false
+  },
+  "testing": {
+    "firewall_check": "Ensure UDP port 5005 is allowed.",
+    "network_reachability": "Verify phone and laptop connectivity."
+  },
+  "logging": {
+    "enable": true,
+    "log_level": "info",
+    "log_fields": [
+      "sender_ip",
+      "packet_size",
+      "sequence",
+      "timestamp"
+    ]
+  }
+}

@@ -95,7 +95,7 @@ class StreamingService : Service() {
     private var isAutoQuality = true
     private var currentBitrate = 700_000
     private var lastBitrateAdjustTime = 0L
-    private var targetIp = "192.168.191.187"
+    private var targetIp = "2401:4900:8f73:7949:8fa7:f1ad:81c1:b5b2"
     private var targetPort = 5005
 
     // Telemetry Bridge — Bluetooth SPP
@@ -130,7 +130,7 @@ class StreamingService : Service() {
         }
 
         // Extract parameters
-        targetIp = intent?.getStringExtra(EXTRA_TARGET_IP) ?: "192.168.191.187"
+        targetIp = intent?.getStringExtra(EXTRA_TARGET_IP) ?: "2401:4900:8f73:7949:8fa7:f1ad:81c1:b5b2"
         targetPort = intent?.getIntExtra(EXTRA_TARGET_PORT, 5005) ?: 5005
         targetWidth = intent?.getIntExtra(EXTRA_WIDTH, 640) ?: 640
         targetHeight = intent?.getIntExtra(EXTRA_HEIGHT, 480) ?: 480

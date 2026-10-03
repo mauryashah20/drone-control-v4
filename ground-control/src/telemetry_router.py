@@ -66,7 +66,7 @@ class TelemetryRouter:
 
     def __init__(
         self,
-        phone_bind_ip: str = "0.0.0.0",
+        phone_bind_ip: str = "::",
         phone_bind_port: int = 14551,
         mp_host: str = "127.0.0.1",
         mp_port: int = 14550,
@@ -141,15 +141,26 @@ class TelemetryRouter:
         self._log("Stopped telemetry router")
 
     def _run_loop(self):
-        # 1. Setup UDP socket to listen for packets from Phone Transmitter
+        # 1. Setup UDP socket to listen for packets from Phone Transmitter (Dual-stack IPv6 + IPv4)
         try:
-            self._phone_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self._phone_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._phone_sock.bind((self.phone_bind_ip, self.phone_bind_port))
-            self._phone_sock.setblocking(False)
-        except Exception as e:
-            self._log(f"Error binding phone UDP socket ({self.phone_bind_ip}:{self.phone_bind_port}): {e}")
-            return
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            bind_addr = self.phone_bind_ip if self.phone_bind_ip not in ("0.0.0.0", "") else "::"
+            sock.bind((bind_addr, self.phone_bind_port))
+            sock.setblocking(False)
+            self._phone_sock = sock
+        except Exception:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                bind_addr = self.phone_bind_ip if self.phone_bind_ip != "::" else "0.0.0.0"
+                sock.bind((bind_addr, self.phone_bind_port))
+                sock.setblocking(False)
+                self._phone_sock = sock
+            except Exception as e:
+                self._log(f"Error binding phone UDP socket ({self.phone_bind_ip}:{self.phone_bind_port}): {e}")
+                return
 
         # 2. Setup UDP socket to communicate with Mission Planner (localhost)
         try:

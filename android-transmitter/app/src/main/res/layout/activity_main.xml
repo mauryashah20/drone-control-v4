@@ -239,10 +239,13 @@
                             android:paddingEnd="10dp"
                             android:textColor="@color/white_pure"
                             android:textColorHint="@color/text_dim"
-                            android:textSize="13sp"
+                            android:textSize="11sp"
+                            android:maxLines="1"
+                            android:singleLine="true"
+                            android:scrollHorizontally="true"
                             android:fontFamily="monospace"
                             android:inputType="text"
-                            android:text="192.168.191.187" />
+                            android:text="2401:4900:8f73:7949:8fa7:f1ad:81c1:b5b2" />
                     </LinearLayout>
 
                     <LinearLayout

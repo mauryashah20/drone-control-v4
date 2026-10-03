@@ -48,7 +48,7 @@ class ZeroLatencyVideoReceiver:
 
     def __init__(
         self,
-        bind_ip: str = "0.0.0.0",
+        bind_ip: str = "::",
         port: int = 5005,
         on_frame: Optional[Callable[[np.ndarray, FrameStats], None]] = None,
         on_connection_change: Optional[Callable[[bool, str, Optional[str]], None]] = None,
@@ -197,18 +197,31 @@ class ZeroLatencyVideoReceiver:
         self._log("Receiver stopped")
 
     def _open_socket(self) -> None:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-        # 4 MB socket receive buffer to prevent OS UDP drops on burst frames
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-        except OSError:
-            pass
-
-        sock.settimeout(0.1)  # 100ms timeout so loop can exit cleanly and check watchdog
-        sock.bind((self.bind_ip, self.port))
-        self._sock = sock
+            # Dual-stack IPv6 socket (receives both IPv6 and IPv4 traffic)
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            except OSError:
+                pass
+            sock.settimeout(0.1)
+            bind_addr = self.bind_ip if self.bind_ip not in ("0.0.0.0", "") else "::"
+            sock.bind((bind_addr, self.port))
+            self._sock = sock
+        except Exception:
+            # Fallback to pure IPv4 socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            except OSError:
+                pass
+            sock.settimeout(0.1)
+            bind_addr = self.bind_ip if self.bind_ip != "::" else "0.0.0.0"
+            sock.bind((bind_addr, self.port))
+            self._sock = sock
 
     def _close_socket(self) -> None:
         if self._sock:

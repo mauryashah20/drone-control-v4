@@ -45,6 +45,7 @@ class MainActivity : AppCompatActivity() {
 
     private var isStreaming = false
     private val PREFS_NAME = "drone_streamer_prefs"
+    private val DEFAULT_TARGET_IP = "2401:4900:8f73:7949:8fa7:f1ad:81c1:b5b2"
 
     private val statsReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -215,7 +216,7 @@ class MainActivity : AppCompatActivity() {
                 else -> "Fixed 360p (640x360)"
             }
             val fpsStr = if (rbFps60.isChecked) "60fps" else "30fps"
-            val ip = etTargetIp.text.toString().trim().ifEmpty { "192.168.191.187" }
+            val ip = etTargetIp.text.toString().trim().ifEmpty { DEFAULT_TARGET_IP }
             val port = etTargetPort.text.toString().trim().ifEmpty { "5005" }
             tvStatusDetail.text = "Direct Qualcomm AVC pipe ready • Configured for $qualityStr @ $fpsStr to $ip:$port"
         }
@@ -328,7 +329,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun loadPreferences() {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        etTargetIp.setText(prefs.getString("target_ip", "192.168.191.187"))
+        val savedIp = prefs.getString("target_ip", DEFAULT_TARGET_IP) ?: DEFAULT_TARGET_IP
+        val effectiveIp = if (savedIp == "192.168.191.187" || savedIp.isBlank()) DEFAULT_TARGET_IP else savedIp
+        etTargetIp.setText(effectiveIp)
         etTargetPort.setText(prefs.getInt("target_port", 5005).toString())
         etEspIp.setText(prefs.getString("esp_ip", "APM-Bridge"))
         etTelemPort.setText(prefs.getInt("telemetry_port", 14551).toString())

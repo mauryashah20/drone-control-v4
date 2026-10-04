@@ -111,7 +111,7 @@ class StreamingService : Service() {
 
     // Packet buffers - 1150 bytes safe MTU avoids cellular carrier fragmentation
     private val mtuBytes = 1150
-    private val headerSize = 16 // 4 frame_seq + 2 chunk_idx + 2 total_chunks + 8 ts_ms
+    private val headerSize = 18 // 4 frame_seq + 1 slice_idx + 1 total_slices + 2 chunk_idx + 2 total_chunks + 8 ts_ms
     private val payloadMtu = mtuBytes - headerSize
     private val videoPacketBuffer = ByteArray(2048)
 
@@ -343,12 +343,17 @@ class StreamingService : Service() {
                 setInteger("vendor.qti-ext-enc-initial-qp.qp-p", 24)
             } catch (_: Exception) {}
 
-            // Single slice configuration: force deblocking across the entire frame width
+            // 4-Slice Configuration: Divide frame into 4 horizontal slices (120px tall each for 480p)
+            val numSlices = 4
+            val sliceHeight = targetHeight / numSlices
             try {
-                setInteger("slice-height", targetHeight)
+                setInteger("slice-height", sliceHeight)
             } catch (_: Exception) {}
             try {
-                setInteger("vendor.qti-ext-enc-multi-slice.num-slices", 1)
+                setInteger("vendor.qti-ext-enc-multi-slice.num-slices", numSlices)
+            } catch (_: Exception) {}
+            try {
+                setInteger("vendor.qti-ext-enc-slice-delivery-mode.enable", 1)
             } catch (_: Exception) {}
             try {
                 setInteger("vendor.qti-ext-enc-caps-ltr.max-count", 0)
@@ -613,45 +618,28 @@ class StreamingService : Service() {
                 val now = System.currentTimeMillis()
 
                 if (outIndex >= 0) {
-                    // Pure FPV: If multiple frames backed up in the encoder queue,
-                    // drop stale older frames immediately so the cellular modem NEVER transmits old video!
-                    var latestIndex = outIndex
-                    var latestOffset = bufferInfo.offset
-                    var latestSize = bufferInfo.size
-
-                    while (true) {
-                        val nextIndex = try {
-                            codec.dequeueOutputBuffer(bufferInfo, 0L)
-                        } catch (_: Exception) { -1 }
-
-                        if (nextIndex >= 0) {
-                            try { codec.releaseOutputBuffer(latestIndex, false) } catch (_: Exception) {}
-                            latestIndex = nextIndex
-                            latestOffset = bufferInfo.offset
-                            latestSize = bufferInfo.size
-                        } else {
-                            break
-                        }
-                    }
-
                     val encodedBuffer = try {
-                        codec.getOutputBuffer(latestIndex)
+                        codec.getOutputBuffer(outIndex)
                     } catch (_: Exception) {
                         null
                     }
-                    if (encodedBuffer != null && latestSize > 0) {
-                        encodedBuffer.position(latestOffset)
-                        encodedBuffer.limit(latestOffset + latestSize)
+                    if (encodedBuffer != null && bufferInfo.size > 0) {
+                        encodedBuffer.position(bufferInfo.offset)
+                        encodedBuffer.limit(bufferInfo.offset + bufferInfo.size)
 
-                        val pkts = sendDirectChunkedUdp(encodedBuffer, sequence)
-                        packetsSentSinceReport += pkts
-                        bytesSentSinceReport += latestSize
+                        val slices = extractSlicesFromBuffer(encodedBuffer)
+                        val totalSlices = slices.size
+                        for ((sliceIdx, sliceBytes) in slices.withIndex()) {
+                            val pkts = sendSliceChunkedUdp(sliceBytes, sequence, sliceIdx, totalSlices, now)
+                            packetsSentSinceReport += pkts
+                            bytesSentSinceReport += sliceBytes.size
+                        }
                         framesSentSinceReport += 1
                         sequence++
                         lastPacketSentTime = now
                     }
                     try {
-                        codec.releaseOutputBuffer(latestIndex, false)
+                        codec.releaseOutputBuffer(outIndex, false)
                     } catch (_: Exception) {}
                 } else if (outIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
                     // Timed out with no frame — only send keep-alive every 80ms
@@ -730,28 +718,120 @@ class StreamingService : Service() {
     }
 
     /**
-     * Chunk and transmit NAL units over UDP with 16-byte robust header
+     * Splits a MediaCodec H.264 output buffer into individual Annex B slice NAL units.
+     * Prepends parameter sets (SPS=7, PPS=8, SEI=6) to Slice 0 so each keyframe slice is decodable.
      */
-    private fun sendDirectChunkedUdp(buffer: ByteBuffer, sequence: Long): Int {
+    private fun extractSlicesFromBuffer(buffer: ByteBuffer): List<ByteArray> {
+        val totalBytes = buffer.remaining()
+        if (totalBytes < 4) return emptyList()
+
+        val raw = ByteArray(totalBytes)
+        val originalPos = buffer.position()
+        buffer.get(raw)
+        buffer.position(originalPos)
+
+        val startOffsets = ArrayList<Int>()
+        var i = 0
+        while (i < totalBytes - 3) {
+            if (raw[i] == 0.toByte() && raw[i + 1] == 0.toByte()) {
+                if (raw[i + 2] == 1.toByte()) {
+                    startOffsets.add(i)
+                    i += 3
+                    continue
+                } else if (i < totalBytes - 4 && raw[i + 2] == 0.toByte() && raw[i + 3] == 1.toByte()) {
+                    startOffsets.add(i)
+                    i += 4
+                    continue
+                }
+            }
+            i++
+        }
+
+        if (startOffsets.isEmpty()) {
+            return listOf(raw)
+        }
+
+        val nalUnits = ArrayList<ByteArray>()
+        for (idx in 0 until startOffsets.size) {
+            val start = startOffsets[idx]
+            val end = if (idx + 1 < startOffsets.size) startOffsets[idx + 1] else totalBytes
+            nalUnits.add(raw.copyOfRange(start, end))
+        }
+
+        val slices = ArrayList<ByteArray>()
+        var headerAcc: ByteArray? = null
+
+        for (nal in nalUnits) {
+            var offset = 0
+            while (offset < nal.size && nal[offset] == 0.toByte()) {
+                offset++
+            }
+            if (offset < nal.size && nal[offset] == 1.toByte()) {
+                offset++
+            }
+            val nalType = if (offset < nal.size) (nal[offset].toInt() and 0x1F) else 0
+
+            if (nalType == 7 || nalType == 8 || nalType == 6) {
+                // SPS, PPS, or SEI - prepend to first video slice
+                headerAcc = if (headerAcc == null) nal else headerAcc + nal
+            } else if (nalType == 1 || nalType == 5) {
+                // Video slice
+                if (headerAcc != null) {
+                    slices.add(headerAcc + nal)
+                    headerAcc = null
+                } else {
+                    slices.add(nal)
+                }
+            } else {
+                slices.add(nal)
+            }
+        }
+
+        if (slices.isEmpty()) {
+            return listOf(raw)
+        }
+        return slices
+    }
+
+    /**
+     * Chunk and transmit progressive slice NAL unit over UDP with 18-byte slice-aware header
+     */
+    private fun sendSliceChunkedUdp(
+        sliceBytes: ByteArray,
+        sequence: Long,
+        sliceIdx: Int,
+        totalSlices: Int,
+        timestampMs: Long
+    ): Int {
         val socket = udpSocket ?: return 0
         val target = udpTarget ?: return 0
 
-        val totalSize = buffer.remaining()
+        val totalSize = sliceBytes.size
         val totalChunks = (totalSize + payloadMtu - 1) / payloadMtu
-        val timestampMs = System.currentTimeMillis()
         val frameSeqInt = (sequence and 0xFFFFFFFFL).toInt()
 
         var packetsCount = 0
+        var offset = 0
 
         for (chunkIdx in 0 until totalChunks) {
-            val chunkSize = minOf(payloadMtu, buffer.remaining())
+            val chunkSize = minOf(payloadMtu, totalSize - offset)
 
+            // 18-byte Slice Header:
+            // 0..3: Frame Seq (uint32)
+            // 4: Slice Idx (uint8)
+            // 5: Total Slices (uint8)
+            // 6..7: Chunk Idx (uint16)
+            // 8..9: Total Chunks (uint16)
+            // 10..17: Timestamp ms (uint64)
             writeInt(videoPacketBuffer, 0, frameSeqInt)
-            writeShort(videoPacketBuffer, 4, chunkIdx.toShort())
-            writeShort(videoPacketBuffer, 6, totalChunks.toShort())
-            writeLong(videoPacketBuffer, 8, timestampMs)
+            videoPacketBuffer[4] = (sliceIdx and 0xFF).toByte()
+            videoPacketBuffer[5] = (totalSlices and 0xFF).toByte()
+            writeShort(videoPacketBuffer, 6, chunkIdx.toShort())
+            writeShort(videoPacketBuffer, 8, totalChunks.toShort())
+            writeLong(videoPacketBuffer, 10, timestampMs)
 
-            buffer.get(videoPacketBuffer, headerSize, chunkSize)
+            System.arraycopy(sliceBytes, offset, videoPacketBuffer, headerSize, chunkSize)
+            offset += chunkSize
 
             val packet = DatagramPacket(videoPacketBuffer, headerSize + chunkSize, target.address, target.port)
             try {
@@ -759,7 +839,7 @@ class StreamingService : Service() {
                 packetsCount++
             } catch (_: Exception) {}
 
-            // Micro-pacing for multi-chunk bursts: paces packets evenly to prevent cellular modem/router buffer overflow
+            // Micro-pacing for multi-chunk bursts: paces packets evenly
             if (totalChunks > 1 && chunkIdx < totalChunks - 1) {
                 java.util.concurrent.locks.LockSupport.parkNanos(35_000L) // 35 microseconds inter-packet spacing
             }

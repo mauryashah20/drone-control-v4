@@ -8,7 +8,7 @@ from typing import Callable, Optional, Dict
 import av
 import numpy as np
 
-HEADER_SIZE = 16  # 4 bytes frame_seq, 2 bytes chunk_idx, 2 bytes total_chunks, 8 bytes timestamp_ms
+HEADER_SIZE = 18  # 4B frame_seq, 1B slice_idx, 1B total_slices, 2B chunk_idx, 2B total_chunks, 8B ts_ms
 START_CODE = b"\x00\x00\x00\x01"
 
 # Control packet signatures
@@ -76,10 +76,12 @@ class ZeroLatencyVideoReceiver:
         self.last_connected_time: float = 0.0
         self._last_sender_addr: Optional[tuple] = None
 
-        # Decoder & Frame assembly
+        # Decoder & Progressive Slice assembly
         self._decoder = self._create_decoder()
-        self._frame_parts: Dict[int, Dict[int, bytes]] = {}
-        self._frame_totals: Dict[int, int] = {}
+        self._slice_chunks: Dict[int, Dict[int, Dict[int, bytes]]] = {}
+        self._slice_chunk_totals: Dict[int, Dict[int, int]] = {}
+        self._frame_total_slices: Dict[int, int] = {}
+        self._completed_slices: Dict[int, Dict[int, bytes]] = {}
         self._frame_timestamps: Dict[int, int] = {}
         self._last_completed_seq: Optional[int] = None
         self._dropped_frames = 0
@@ -115,8 +117,10 @@ class ZeroLatencyVideoReceiver:
 
     def _reset_stream_state(self, reason: str = "") -> None:
         """Purges any partial chunks, resets sequence counters, and recreates the H.264 decoder."""
-        self._frame_parts.clear()
-        self._frame_totals.clear()
+        self._slice_chunks.clear()
+        self._slice_chunk_totals.clear()
+        self._frame_total_slices.clear()
+        self._completed_slices.clear()
         self._frame_timestamps.clear()
         self._last_completed_seq = None
         self._frame_times.clear()
@@ -303,68 +307,83 @@ class ZeroLatencyVideoReceiver:
             self.last_packet_time = now
             self._bytes_received += len(data)
 
-            # Parse 16-byte header:
+            # Parse 18-byte Slice Header:
             # 0..3: Frame Sequence (uint32)
-            # 4..5: Chunk Index (uint16)
-            # 6..7: Total Chunks (uint16)
-            # 8..15: Timestamp in ms (uint64)
-            frame_seq = struct.unpack_from(">I", data, 0)[0]
-            chunk_idx = struct.unpack_from(">H", data, 4)[0]
-            total_chunks = struct.unpack_from(">H", data, 6)[0]
-            ts_ms = struct.unpack_from(">Q", data, 8)[0]
+            # 4: Slice Index (uint8)
+            # 5: Total Slices (uint8)
+            # 6..7: Chunk Index (uint16)
+            # 8..9: Total Chunks (uint16)
+            # 10..17: Timestamp in ms (uint64)
+            frame_seq, slice_idx, total_slices, chunk_idx, total_chunks, ts_ms = struct.unpack_from(">IBBHHQ", data, 0)
             payload = data[HEADER_SIZE:]
 
             with self._lock:
                 # Discard stale packets from frames already completed
                 if self._last_completed_seq is not None:
-                    # Allow sequence rollover or reset if diff is large
                     diff = self._last_completed_seq - frame_seq
                     if 0 <= diff < 100:
                         continue
 
-                # Store chunk
-                if frame_seq not in self._frame_parts:
-                    # Evict oldest incomplete frames if buffer has more than 4 frames (absorbs UDP packet reordering/jitter)
-                    if len(self._frame_parts) > 4:
-                        oldest = min(self._frame_parts.keys())
+                # Evict oldest incomplete frames if buffer has more than 4 frames
+                if frame_seq not in self._slice_chunks:
+                    if len(self._slice_chunks) > 4:
+                        oldest = min(self._slice_chunks.keys())
                         self._dropped_frames += 1
-                        self._frame_parts.pop(oldest, None)
-                        self._frame_totals.pop(oldest, None)
+                        self._slice_chunks.pop(oldest, None)
+                        self._slice_chunk_totals.pop(oldest, None)
+                        self._frame_total_slices.pop(oldest, None)
+                        self._completed_slices.pop(oldest, None)
                         self._frame_timestamps.pop(oldest, None)
 
-                    self._frame_parts[frame_seq] = {}
-                    self._frame_totals[frame_seq] = total_chunks
+                    self._slice_chunks[frame_seq] = {}
+                    self._slice_chunk_totals[frame_seq] = {}
+                    self._frame_total_slices[frame_seq] = total_slices
+                    self._completed_slices[frame_seq] = {}
                     self._frame_timestamps[frame_seq] = ts_ms
 
-                self._frame_parts[frame_seq][chunk_idx] = payload
+                # Store chunk in slice buffer
+                if slice_idx not in self._slice_chunks[frame_seq]:
+                    self._slice_chunks[frame_seq][slice_idx] = {}
+                    self._slice_chunk_totals[frame_seq][slice_idx] = total_chunks
 
-                # Check if all chunks for this frame have arrived
-                if len(self._frame_parts[frame_seq]) == total_chunks:
-                    # Reconstruct full frame in exact 0..total_chunks-1 sequence order
-                    full_frame = b"".join(self._frame_parts[frame_seq][i] for i in range(total_chunks))
-                    frame_ts = self._frame_timestamps.pop(frame_seq, ts_ms)
-                    self._frame_parts.pop(frame_seq, None)
-                    self._frame_totals.pop(frame_seq, None)
+                self._slice_chunks[frame_seq][slice_idx][chunk_idx] = payload
 
-                    # Track dropped frame gaps
-                    if self._last_completed_seq is not None:
-                        gap = frame_seq - (self._last_completed_seq + 1)
-                        if 0 < gap < 1000:
-                            self._dropped_frames += gap
+                # Check if all chunks for this slice have arrived
+                if len(self._slice_chunks[frame_seq][slice_idx]) == total_chunks:
+                    slice_data = b"".join(self._slice_chunks[frame_seq][slice_idx][i] for i in range(total_chunks))
+                    self._completed_slices[frame_seq][slice_idx] = slice_data
+                    self._slice_chunks[frame_seq].pop(slice_idx, None)
 
-                    self._last_completed_seq = frame_seq
+                    # Check if all slices for this frame have arrived
+                    expected_slices = self._frame_total_slices.get(frame_seq, total_slices)
+                    if len(self._completed_slices[frame_seq]) == expected_slices:
+                        # Reconstruct full frame from all slices in sequence
+                        full_frame = b"".join(self._completed_slices[frame_seq][i] for i in range(expected_slices))
+                        frame_ts = self._frame_timestamps.pop(frame_seq, ts_ms)
+                        self._slice_chunks.pop(frame_seq, None)
+                        self._slice_chunk_totals.pop(frame_seq, None)
+                        self._frame_total_slices.pop(frame_seq, None)
+                        self._completed_slices.pop(frame_seq, None)
 
-                    # Non-blocking handoff to decoder thread (drops stale frame if decoder is busy)
-                    try:
-                        if self._decode_queue.full():
-                            try:
-                                self._decode_queue.get_nowait()
-                                self._dropped_frames += 1
-                            except queue.Empty:
-                                pass
-                        self._decode_queue.put_nowait((frame_seq, full_frame, frame_ts))
-                    except Exception:
-                        pass
+                        # Track dropped frame gaps
+                        if self._last_completed_seq is not None:
+                            gap = frame_seq - (self._last_completed_seq + 1)
+                            if 0 < gap < 1000:
+                                self._dropped_frames += gap
+
+                        self._last_completed_seq = frame_seq
+
+                        # Non-blocking handoff to decoder thread
+                        try:
+                            if self._decode_queue.full():
+                                try:
+                                    self._decode_queue.get_nowait()
+                                    self._dropped_frames += 1
+                                except queue.Empty:
+                                    pass
+                            self._decode_queue.put_nowait((frame_seq, full_frame, frame_ts))
+                        except Exception:
+                            pass
 
     def _decode_worker(self) -> None:
         """Dedicated decoding worker running off the UDP network socket thread."""

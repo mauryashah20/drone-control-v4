@@ -7,10 +7,11 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "moduleResolution": "node",
+    "types": ["node"],
     "outDir": ".vercel/output",
     "rootDir": ".",
     "baseUrl": "."
   },
-  "include": ["api/**/*", "lib/**/*"],
-  "exclude": ["node_modules", "drone-client", "ground-client", "scripts"]
+  "include": ["api/**/*", "lib/**/*", "scripts/**/*"],
+  "exclude": ["node_modules", "drone-client", "ground-client"]
 }

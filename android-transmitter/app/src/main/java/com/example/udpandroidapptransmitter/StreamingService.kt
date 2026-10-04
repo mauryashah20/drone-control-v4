@@ -243,6 +243,23 @@ class StreamingService : Service() {
         }
     }
 
+    private fun createBestQualcommEncoder(): MediaCodec {
+        val candidateNames = listOf(
+            "c2.qti.avc.encoder.low_latency",
+            "c2.qti.avc.encoder",
+            "OMX.qcom.video.encoder.avc"
+        )
+        for (name in candidateNames) {
+            try {
+                val codec = MediaCodec.createByCodecName(name)
+                Log.i(TAG, "Selected optimized Qualcomm hardware encoder: $name")
+                return codec
+            } catch (_: Exception) {}
+        }
+        Log.i(TAG, "Falling back to default AVC encoder")
+        return MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+    }
+
     private fun setupHardwareEncoder() {
         Log.i(TAG, "Configuring Qualcomm Hardware AVC Encoder: ${targetWidth}x${targetHeight} @ ${targetFps}fps, ${targetBitrate / 1000}kbps")
 
@@ -258,8 +275,21 @@ class StreamingService : Service() {
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
             setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
             setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
-            setInteger(MediaFormat.KEY_PRIORITY, 0)
+            setInteger(MediaFormat.KEY_PRIORITY, 0) // Real-time priority
 
+            // 1. VPU clock governor boost: force Qualcomm VPU to run at maximum operating frequency
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                try { setFloat(MediaFormat.KEY_OPERATING_RATE, 240.0f) } catch (_: Exception) {}
+                try { setInteger(MediaFormat.KEY_OPERATING_RATE, 240) } catch (_: Exception) {}
+            }
+
+            // 2. Periodic Intra Refresh (PIR): smooth out cellular spikes by refreshing macroblocks across frames
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                try { setInteger(MediaFormat.KEY_INTRA_REFRESH_PERIOD, targetFps) } catch (_: Exception) {}
+            }
+            try { setInteger("vendor.qti-ext-enc-intra-refresh.period", targetFps) } catch (_: Exception) {}
+
+            // 3. Android Low-latency & zero-lookahead flags
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             }
@@ -271,6 +301,16 @@ class StreamingService : Service() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
             }
+
+            // 4. Qualcomm hardware low-latency & slice delivery extensions
+            try { setInteger("vendor.qti-ext-enc-low-latency.enable", 1) } catch (_: Exception) {}
+            try { setInteger("vendor.qti-ext-enc-slice-delivery-mode.enable", 1) } catch (_: Exception) {}
+
+            // 5. Initial QP override: prevent initial bitrate/QP hunting on stream startup
+            try {
+                setInteger("vendor.qti-ext-enc-initial-qp.qp-i", 26)
+                setInteger("vendor.qti-ext-enc-initial-qp.qp-p", 26)
+            } catch (_: Exception) {}
 
             // ── Qualcomm tile-seam fix ────────────────────────────────────────
             // The Snapdragon encoder splits 640-wide frames into two 320px tiles
@@ -294,7 +334,7 @@ class StreamingService : Service() {
             } catch (_: Exception) {}
         }
 
-        val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        val codec = createBestQualcommEncoder()
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         inputSurface = codec.createInputSurface()
         codec.start()

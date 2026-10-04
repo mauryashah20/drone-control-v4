@@ -439,6 +439,38 @@
                     </LinearLayout>
                 </LinearLayout>
 
+                <!-- Camera Image & Contrast Adjustment -->
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:background="@color/gold_subtle"
+                    android:layout_marginTop="12dp"
+                    android:layout_marginBottom="8dp" />
+
+                <CheckBox
+                    android:id="@+id/cb_auto_contrast"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="AUTO CONTRAST &amp; EXPOSURE (ISP TONE-MAP)"
+                    android:textColor="@color/gold_bright"
+                    android:textSize="11sp"
+                    android:textStyle="bold"
+                    android:fontFamily="monospace"
+                    android:checked="true"
+                    app:buttonTint="@color/checkbox_neon_tint" />
+
+                <TextView
+                    android:id="@+id/tv_contrast_subtitle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="32dp"
+                    android:layout_marginTop="-2dp"
+                    android:layout_marginBottom="4dp"
+                    android:text="Dynamic range compression • Prevents blown highlights &amp; dark clipping"
+                    android:textColor="@color/white_secondary"
+                    android:textSize="10sp"
+                    android:fontFamily="monospace" />
+
                 <!-- MAVLink Gold Divider -->
                 <View
                     android:layout_width="match_parent"

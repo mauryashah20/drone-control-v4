@@ -37,7 +37,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnRegisterDrone: com.google.android.material.button.MaterialButton
     private lateinit var btnDiscoverTarget: com.google.android.material.button.MaterialButton
 
-    // Telemetry UI Elements
+    // Telemetry & Camera UI Elements
+    private lateinit var cbAutoContrast: CheckBox
     private lateinit var cbEnableTelem: CheckBox
     private lateinit var etEspIp: EditText
     private lateinit var etTelemPort: EditText
@@ -156,6 +157,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        cbAutoContrast = findViewById(R.id.cb_auto_contrast)
         cbEnableTelem = findViewById(R.id.cb_enable_telem)
         etEspIp = findViewById(R.id.et_esp_ip)
         etTelemPort = findViewById(R.id.et_telem_port)
@@ -197,6 +199,23 @@ class MainActivity : AppCompatActivity() {
             }
             updateIdleStatusDetail()
             saveCurrentPreferences()
+        }
+
+        // Auto Contrast listener with live-updating support during streaming
+        cbAutoContrast.setOnCheckedChangeListener { _, isChecked ->
+            saveCurrentPreferences()
+            if (isStreaming) {
+                val serviceIntent = Intent(this, StreamingService::class.java).apply {
+                    action = StreamingService.ACTION_SET_CONTRAST
+                    putExtra(StreamingService.EXTRA_AUTO_CONTRAST, isChecked)
+                }
+                startService(serviceIntent)
+                Toast.makeText(
+                    this,
+                    if (isChecked) "Auto contrast ENABLED" else "Manual exposure LOCKED",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
         }
 
         // Telemetry toggle listener
@@ -286,16 +305,16 @@ class MainActivity : AppCompatActivity() {
 
         val (width, height, bitrate) = when {
             isAuto -> {
-                // Auto mode: balanced 480p, dynamically adapts based on latency
-                val br = if (fps == 60) 700_000 else 500_000
+                // Auto mode: high-detail 480p
+                val br = if (fps == 60) 1_400_000 else 1_000_000
                 Triple(640, 480, br)
             }
             rb360p.isChecked -> {
-                val br = if (fps == 60) 450_000 else 300_000
+                val br = if (fps == 60) 700_000 else 500_000
                 Triple(640, 360, br)
             }
             else -> {
-                val br = if (fps == 60) 1_500_000 else 1_000_000
+                val br = if (fps == 60) 1_800_000 else 1_300_000
                 Triple(640, 480, br)
             }
         }
@@ -309,6 +328,7 @@ class MainActivity : AppCompatActivity() {
             putExtra(StreamingService.EXTRA_FPS, fps)
             putExtra(StreamingService.EXTRA_BITRATE, bitrate)
             putExtra(StreamingService.EXTRA_AUTO_QUALITY, isAuto)
+            putExtra(StreamingService.EXTRA_AUTO_CONTRAST, cbAutoContrast.isChecked)
             putExtra(StreamingService.EXTRA_ENABLE_TELEMETRY, enableTelem)
             putExtra(StreamingService.EXTRA_ESP_IP, espIp)
             putExtra(StreamingService.EXTRA_TELEMETRY_PORT, telemPort)
@@ -414,6 +434,7 @@ class MainActivity : AppCompatActivity() {
 
         val enableTelem = prefs.getBoolean("enable_telemetry", true)
         cbEnableTelem.isChecked = enableTelem
+        cbAutoContrast.isChecked = prefs.getBoolean("auto_contrast", true)
         etEspIp.isEnabled = enableTelem
         etTelemPort.isEnabled = enableTelem
         etEspIp.alpha = if (enableTelem) 1.0f else 0.45f
@@ -456,6 +477,7 @@ class MainActivity : AppCompatActivity() {
             .putString("esp_ip", espIp)
             .putInt("telemetry_port", telemPort)
             .putBoolean("enable_telemetry", enableTelem)
+            .putBoolean("auto_contrast", cbAutoContrast.isChecked)
             .putString("selected_quality", quality)
             .putInt("selected_fps", fps)
             .apply()

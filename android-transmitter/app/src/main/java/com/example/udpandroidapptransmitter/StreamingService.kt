@@ -41,6 +41,7 @@ class StreamingService : Service() {
         // Actions
         const val ACTION_START = "com.example.udpandroidapptransmitter.START"
         const val ACTION_STOP = "com.example.udpandroidapptransmitter.STOP"
+        const val ACTION_SET_CONTRAST = "com.example.udpandroidapptransmitter.SET_CONTRAST"
         const val ACTION_STATS_BROADCAST = "com.example.udpandroidapptransmitter.STATS"
         const val ACTION_STREAMING_STOPPED = "com.example.udpandroidapptransmitter.STOPPED"
 
@@ -52,6 +53,7 @@ class StreamingService : Service() {
         const val EXTRA_FPS = "fps"
         const val EXTRA_BITRATE = "bitrate"
         const val EXTRA_AUTO_QUALITY = "auto_quality"
+        const val EXTRA_AUTO_CONTRAST = "auto_contrast"
 
         const val EXTRA_LIVE_FPS = "live_fps"
         const val EXTRA_LIVE_KBPS = "live_kbps"
@@ -96,6 +98,7 @@ class StreamingService : Service() {
     private var targetFps = 30
     private var targetBitrate = 700_000
     private var isAutoQuality = true
+    private var isAutoContrast = true
     private var currentBitrate = 700_000
     private var targetIp = "2401:4900:8f73:7949:8fa7:f1ad:81c1:b5b2"
     private var targetPort = 5005
@@ -148,6 +151,14 @@ class StreamingService : Service() {
             return START_NOT_STICKY
         }
 
+        if (action == ACTION_SET_CONTRAST) {
+            val autoContrast = intent?.getBooleanExtra(EXTRA_AUTO_CONTRAST, true) ?: true
+            isAutoContrast = autoContrast
+            Log.i(TAG, "Dynamic auto contrast update: isAutoContrast=$isAutoContrast")
+            updateCaptureSettings()
+            return START_NOT_STICKY
+        }
+
         synchronized(stateLock) {
             if (isStreaming.get()) {
                 Log.w(TAG, "Streaming was active - resetting session for new start command")
@@ -162,6 +173,7 @@ class StreamingService : Service() {
             targetFps = intent?.getIntExtra(EXTRA_FPS, 30) ?: 30
             targetBitrate = intent?.getIntExtra(EXTRA_BITRATE, 700_000) ?: 700_000
             isAutoQuality = intent?.getBooleanExtra(EXTRA_AUTO_QUALITY, true) ?: true
+            isAutoContrast = intent?.getBooleanExtra(EXTRA_AUTO_CONTRAST, true) ?: true
             currentBitrate = targetBitrate
 
             isTelemetryEnabled = intent?.getBooleanExtra(EXTRA_ENABLE_TELEMETRY, true) ?: true
@@ -277,16 +289,21 @@ class StreamingService : Service() {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, targetBitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, targetFps)
-            // 60-second I-frame interval: eliminates periodic 1-2s IDR keyframe burst spikes.
-            // Intra-refresh smoothly updates macroblocks every frame instead.
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 60)
+            // 2-second keyframe interval: clean periodic IDR sync without continuous intra-refresh sweep distortion.
+            // On-demand keyframes (0xFF 0x02) from receiver handle packet loss instantly.
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
 
             // Pure FPV: VBR (Variable Bitrate) mode - ZERO buffer smoothing, zero lookahead delay!
-            // CBR mode forces the encoder to buffer frames to smooth the bit stream.
-            // VBR encodes each frame immediately without HRD/VBV buffer latency.
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
-            setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
-            setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
+
+            // High Profile enables 8x8 DCT transform & CABAC entropy coding (eliminates blocky 4x4 macroblocks)
+            try {
+                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
+                setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel4)
+            } catch (_: Exception) {
+                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+                setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
+            }
             setInteger(MediaFormat.KEY_PRIORITY, 0) // Real-time priority
 
             // 1. VPU clock governor boost: force Qualcomm VPU to run at maximum operating frequency
@@ -295,13 +312,12 @@ class StreamingService : Service() {
                 try { setInteger(MediaFormat.KEY_OPERATING_RATE, 240) } catch (_: Exception) {}
             }
 
-            // 2. Periodic Intra Refresh (PIR): smooth out cellular spikes by refreshing macroblocks across frames
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                try { setInteger(MediaFormat.KEY_INTRA_REFRESH_PERIOD, targetFps) } catch (_: Exception) {}
-            }
+            // 2. Bound QP range to eliminate coarse blocky macroblock pixelation
             try {
-                setInteger("vendor.qti-ext-enc-intra-refresh.mode", 1) // Cyclic column/row refresh
-                setInteger("vendor.qti-ext-enc-intra-refresh.period", targetFps)
+                setInteger("vendor.qti-ext-enc-qp-range.qp-i-min", 16)
+                setInteger("vendor.qti-ext-enc-qp-range.qp-i-max", 28)
+                setInteger("vendor.qti-ext-enc-qp-range.qp-p-min", 18)
+                setInteger("vendor.qti-ext-enc-qp-range.qp-p-max", 32)
             } catch (_: Exception) {}
 
             // 3. Android Low-latency & zero-lookahead flags
@@ -321,30 +337,20 @@ class StreamingService : Service() {
             try { setInteger("vendor.qti-ext-enc-low-latency.enable", 1) } catch (_: Exception) {}
             try { setInteger("vendor.qti-ext-enc-slice-delivery-mode.enable", 1) } catch (_: Exception) {}
 
-            // 5. Initial QP override: prevent initial bitrate/QP hunting on stream startup
+            // 5. Initial QP override: start at crisp quality immediately
             try {
-                setInteger("vendor.qti-ext-enc-initial-qp.qp-i", 26)
-                setInteger("vendor.qti-ext-enc-initial-qp.qp-p", 26)
+                setInteger("vendor.qti-ext-enc-initial-qp.qp-i", 22)
+                setInteger("vendor.qti-ext-enc-initial-qp.qp-p", 24)
             } catch (_: Exception) {}
 
-            // ── Qualcomm tile-seam fix ────────────────────────────────────────
-            // The Snapdragon encoder splits 640-wide frames into two 320px tiles
-            // processed in parallel. The tile boundary at x=320 appears as a
-            // visible vertical seam because the deblocking filter stops at tile edges.
-            //
-            // Force the encoder to treat the full frame as a single slice so:
-            //   1. No vertical tile boundary exists in the output NAL units
-            //   2. The deblocking loop filter runs across the full frame width
+            // Single slice configuration: force deblocking across the entire frame width
             try {
-                // Standard key: slice height = full frame → single horizontal slice
                 setInteger("slice-height", targetHeight)
             } catch (_: Exception) {}
             try {
-                // Qualcomm OMX vendor extension: number of slices = 1
                 setInteger("vendor.qti-ext-enc-multi-slice.num-slices", 1)
             } catch (_: Exception) {}
             try {
-                // Disable Qualcomm's internal tiling/parallelism that causes the seam
                 setInteger("vendor.qti-ext-enc-caps-ltr.max-count", 0)
             } catch (_: Exception) {}
         }
@@ -449,36 +455,79 @@ class StreamingService : Service() {
         return bestRange
     }
 
+    /** Dynamically reapplies capture request settings to the active session without interrupting video. */
+    private fun updateCaptureSettings() {
+        val session = captureSession ?: return
+        val device = cameraDevice ?: return
+        val surface = inputSurface ?: return
+        if (!isStreaming.get()) return
+
+        getCameraHandler().post {
+            try {
+                val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                val fpsRange = getBestFpsRange(cameraManager, device.id, targetFps)
+                val hasOis = isOisSupported(cameraManager, device.id)
+                val request = buildCaptureRequest(device, surface, fpsRange, hasOis)
+                session.setRepeatingRequest(request, object : CameraCaptureSession.CaptureCallback() {
+                    override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
+                        Log.w(TAG, "Frame capture failed: reason ${failure.reason}")
+                    }
+                }, getCameraHandler())
+                Log.i(TAG, "Camera capture settings updated: isAutoContrast=$isAutoContrast")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to update camera repeating request", e)
+            }
+        }
+    }
+
+    private fun isOisSupported(manager: CameraManager, cameraId: String): Boolean {
+        return try {
+            val chars = manager.getCameraCharacteristics(cameraId)
+            val oisModes = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+            oisModes != null && oisModes.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     /** Builds a repeating CaptureRequest for the given device, surface, and FPS range. */
-    private fun buildCaptureRequest(device: CameraDevice, surface: Surface, fpsRange: Range<Int>): CaptureRequest {
+    private fun buildCaptureRequest(device: CameraDevice, surface: Surface, fpsRange: Range<Int>, hasOis: Boolean = false): CaptureRequest {
         return device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
             addTarget(surface)
 
             set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
 
-            // ── Manual Exposure Lock ──────────────────────────────────────────
-            // Disabling AE removes two problems:
-            //   1. Latency: AE selection can delay the frame by up to one full
-            //      frame period (33ms at 30fps) while it converges.
-            //   2. Quality: AE overexposes bright outdoor scenes (windows, sky)
-            //      causing blown highlights that the H.264 encoder wastes bits on.
-            //
-            // Shutter 8ms = 1/125s — sharp for drone motion speeds, handles
-            // normal daylight and indoor lighting.  ISO 800 = enough sensitivity
-            // for indoor scenes without excessive noise.
-            //
-            // CONTROL_MODE stays AUTO so AWB and AF continue to work normally.
-            set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
-            set(CaptureRequest.SENSOR_EXPOSURE_TIME, 8_000_000L)       // 8ms in nanoseconds
-            set(CaptureRequest.SENSOR_SENSITIVITY, 800)                 // ISO 800
-            // Frame duration must be >= exposure time and match the target FPS
-            val frameDurationNs = (1_000_000_000L / fpsRange.upper).coerceAtLeast(8_000_001L)
-            set(CaptureRequest.SENSOR_FRAME_DURATION, frameDurationNs)
+            if (isAutoContrast) {
+                // ── Auto Contrast & Exposure Mode ─────────────────────────────────
+                // Enables hardware ISP auto-exposure metering and dynamic range
+                // compression tone-mapping so indoor and outdoor lighting conditions
+                // do not clip highlights or plunge shadows into black.
+                set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+                set(CaptureRequest.CONTROL_AE_LOCK, false)
+                set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
+                set(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_FAST)
+            } else {
+                // ── Manual Exposure Lock (Fallback) ───────────────────────────────
+                set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                set(CaptureRequest.SENSOR_EXPOSURE_TIME, 8_000_000L)       // 8ms in nanoseconds
+                set(CaptureRequest.SENSOR_SENSITIVITY, 800)                 // ISO 800
+                val frameDurationNs = (1_000_000_000L / fpsRange.upper).coerceAtLeast(8_000_001L)
+                set(CaptureRequest.SENSOR_FRAME_DURATION, frameDurationNs)
+                set(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_FAST)
+            }
 
+            // Software EIS adds 30-70ms buffer lag -> KEEP OFF
             set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
-            set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF)
+            // Hardware OIS counteracts drone vibrations with physical gyro-lens suspension (0ms latency!)
+            if (hasOis) {
+                set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)
+                Log.i(TAG, "Hardware Optical Image Stabilization (OIS) enabled (0ms latency)")
+            } else {
+                set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF)
+            }
 
             set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+            set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
 
             set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_FAST)
             set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_FAST)
@@ -489,7 +538,6 @@ class StreamingService : Service() {
             set(CaptureRequest.HOT_PIXEL_MODE, CameraMetadata.HOT_PIXEL_MODE_OFF)
             set(CaptureRequest.SHADING_MODE, CameraMetadata.SHADING_MODE_OFF)
             set(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CameraMetadata.COLOR_CORRECTION_ABERRATION_MODE_OFF)
-            set(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_FAST)
         }.build()
     }
 
@@ -516,7 +564,8 @@ class StreamingService : Service() {
                     captureSession = session
 
                     try {
-                        val request = buildCaptureRequest(device, encoderSurface, fpsRange)
+                        val hasOis = isOisSupported(cameraManager, device.id)
+                        val request = buildCaptureRequest(device, encoderSurface, fpsRange, hasOis)
                         session.setRepeatingRequest(request, object : CameraCaptureSession.CaptureCallback() {
                             override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
                                 Log.w(TAG, "Frame capture failed: reason ${failure.reason}")
@@ -710,9 +759,9 @@ class StreamingService : Service() {
                 packetsCount++
             } catch (_: Exception) {}
 
-            // Micro-pacing for multi-chunk bursts (prevents LTE modem transport block queuing delay)
-            if (totalChunks > 3 && (chunkIdx and 1 == 1)) {
-                java.util.concurrent.locks.LockSupport.parkNanos(35_000L) // 35 microseconds
+            // Micro-pacing for multi-chunk bursts: paces packets evenly to prevent cellular modem/router buffer overflow
+            if (totalChunks > 1 && chunkIdx < totalChunks - 1) {
+                java.util.concurrent.locks.LockSupport.parkNanos(35_000L) // 35 microseconds inter-packet spacing
             }
         }
 

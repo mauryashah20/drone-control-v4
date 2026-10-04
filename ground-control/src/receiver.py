@@ -64,7 +64,7 @@ class ZeroLatencyVideoReceiver:
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
         self._decode_thread: Optional[threading.Thread] = None
-        self._decode_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._decode_queue: queue.Queue = queue.Queue(maxsize=2)
         self._running = threading.Event()
         self._lock = threading.Lock()
 
@@ -324,8 +324,8 @@ class ZeroLatencyVideoReceiver:
 
                 # Store chunk
                 if frame_seq not in self._frame_parts:
-                    # Evict oldest incomplete frames if buffer has more than 2 frames
-                    if len(self._frame_parts) > 2:
+                    # Evict oldest incomplete frames if buffer has more than 4 frames (absorbs UDP packet reordering/jitter)
+                    if len(self._frame_parts) > 4:
                         oldest = min(self._frame_parts.keys())
                         self._dropped_frames += 1
                         self._frame_parts.pop(oldest, None)

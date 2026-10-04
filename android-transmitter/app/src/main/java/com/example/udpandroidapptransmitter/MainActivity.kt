@@ -99,6 +99,7 @@ class MainActivity : AppCompatActivity() {
         loadPreferences()
         checkPermissions()
         startAutomaticRegistrySync()
+        syncTargetFromRegistry()
     }
 
     private fun initViews() {
@@ -471,6 +472,7 @@ class MainActivity : AppCompatActivity() {
         } else {
             registerReceiver(statsReceiver, filter)
         }
+        syncTargetFromRegistry()
     }
 
     override fun onPause() {
@@ -478,6 +480,19 @@ class MainActivity : AppCompatActivity() {
         try {
             unregisterReceiver(statsReceiver)
         } catch (_: Exception) {}
+    }
+
+    private fun syncTargetFromRegistry() {
+        DroneRegistryManager.lookupTarget(deviceId = "GROUND-001") { success, ipv6, port, isOnline, msg ->
+            if (success && ipv6 != null && !isStreaming) {
+                val currentText = etTargetIp.text.toString().trim()
+                if (currentText != ipv6) {
+                    etTargetIp.setText(ipv6)
+                    saveCurrentPreferences()
+                    updateIdleStatusDetail()
+                }
+            }
+        }
     }
 
     @Deprecated("Deprecated in Java")
@@ -494,6 +509,7 @@ class MainActivity : AppCompatActivity() {
         DroneRegistryManager.startAutoSync(applicationContext, port = port) { msg, _ ->
             if (!isStreaming) {
                 tvStatusDetail.text = msg
+                syncTargetFromRegistry()
             }
         }
     }

@@ -11,7 +11,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   try {
     const rawDeviceId = req.query.deviceId || req.query.id;
-    const deviceId = Array.isArray(rawDeviceId) ? rawDeviceId[0] : rawDeviceId;
+    const deviceId = typeof rawDeviceId === "string" 
+      ? rawDeviceId.trim().toUpperCase().replace(/\s+/g, "") 
+      : (Array.isArray(rawDeviceId) && typeof rawDeviceId[0] === "string" ? rawDeviceId[0].trim().toUpperCase().replace(/\s+/g, "") : "");
 
     if (!validateDeviceId(deviceId)) {
       return res.status(400).json({

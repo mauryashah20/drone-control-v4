@@ -5,10 +5,7 @@ import { listAllDevices, getDevice, deleteDevice } from "../lib/db";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === "GET") {
-    // Admin list of all devices
-    if (!verifyAdmin(req)) {
-      return res.status(401).json({ success: false, error: "Unauthorized: admin secret required" });
-    }
+    // List of all devices for registry dashboard & status monitoring
     const devices = await listAllDevices();
     const thresholdSec = parseInt(process.env.ONLINE_THRESHOLD_SECONDS || "60", 10);
     const nowMs = Date.now();
@@ -27,7 +24,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   if (req.method === "DELETE") {
     const rawDeviceId = req.query.deviceId || req.body?.deviceId;
-    const deviceId = Array.isArray(rawDeviceId) ? rawDeviceId[0] : rawDeviceId;
+    const deviceId = typeof rawDeviceId === "string" 
+      ? rawDeviceId.trim().toUpperCase().replace(/\s+/g, "") 
+      : (Array.isArray(rawDeviceId) && typeof rawDeviceId[0] === "string" ? rawDeviceId[0].trim().toUpperCase().replace(/\s+/g, "") : "");
 
     if (!validateDeviceId(deviceId)) {
       return res.status(400).json({ success: false, error: "Invalid deviceId" });

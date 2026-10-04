@@ -6,8 +6,9 @@ import { isIPv6 } from "net";
  */
 export function validateDeviceId(id: unknown): id is string {
   if (typeof id !== "string") return false;
-  if (id.length < 1 || id.length > 64) return false;
-  return /^[A-Za-z0-9_-]+$/.test(id);
+  const clean = id.trim().replace(/\s+/g, "");
+  if (clean.length < 1 || clean.length > 64) return false;
+  return /^[A-Za-z0-9_-]+$/.test(clean);
 }
 
 /**

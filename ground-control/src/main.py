@@ -9,6 +9,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from receiver import ZeroLatencyVideoReceiver, FrameStats, ConnectionState
 from telemetry_router import TelemetryRouter, DroneTelemetryState
+from ground_registry import GroundStationRegistryClient, detect_laptop_ipv6
 
 WINDOW_NAME = "Drone FPV - Ultra-Low Latency Video Feed"
 
@@ -288,9 +289,10 @@ def draw_waiting_screen(counter: int, state: str, reason: str, last_sender: str,
         (hw, _), _ = cv2.getTextSize(hint_text, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
         cv2.putText(frame, hint_text, (cx - hw // 2, cy + 224), cv2.FONT_HERSHEY_SIMPLEX, 0.42, COLOR_NEON_GREEN, 1, cv2.LINE_AA)
     else:
-        sub_text = "LISTENING ON UDP PORT 5005  |  ESP32 BT-SERIAL -> UDP 14551"
-        (sw, _), _ = cv2.getTextSize(sub_text, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
-        cv2.putText(frame, sub_text, (cx - sw // 2, cy + 148), cv2.FONT_HERSHEY_SIMPLEX, 0.42, COLOR_GOLD_BRIGHT, 1, cv2.LINE_AA)
+        laptop_ip = detect_laptop_ipv6() or "SEARCHING"
+        sub_text = f"LISTENING ON UDP PORT 5005  |  GROUND IP: [{laptop_ip}]"
+        (sw, _), _ = cv2.getTextSize(sub_text, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
+        cv2.putText(frame, sub_text, (cx - sw // 2, cy + 148), cv2.FONT_HERSHEY_SIMPLEX, 0.40, COLOR_GOLD_BRIGHT, 1, cv2.LINE_AA)
 
         if telem and telem.is_heartbeat_fresh:
             armed_str = "ARMED" if telem.armed else "DISARMED"
@@ -298,9 +300,9 @@ def draw_waiting_screen(counter: int, state: str, reason: str, last_sender: str,
             (tbw, _), _ = cv2.getTextSize(telem_banner, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
             cv2.putText(frame, telem_banner, (cx - tbw // 2, cy + 176), cv2.FONT_HERSHEY_SIMPLEX, 0.42, COLOR_NEON_GREEN, 1, cv2.LINE_AA)
         else:
-            hint_text = "ENGAGE TRANSMITTER ON ANDROID TO INITIATE LIVE HUD"
-            (hw, _), _ = cv2.getTextSize(hint_text, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
-            cv2.putText(frame, hint_text, (cx - hw // 2, cy + 176), cv2.FONT_HERSHEY_SIMPLEX, 0.44, COLOR_NEON_GREEN, 1, cv2.LINE_AA)
+            hint_text = "VERCEL SYNCED • ENGAGE TRANSMITTER ON ANDROID TO START STREAM"
+            (hw, _), _ = cv2.getTextSize(hint_text, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+            cv2.putText(frame, hint_text, (cx - hw // 2, cy + 176), cv2.FONT_HERSHEY_SIMPLEX, 0.42, COLOR_NEON_GREEN, 1, cv2.LINE_AA)
 
     # Footer Supercar Keybindings Bar
     footer_text = "KEYS: [Q] QUIT  |  [F] FULLSCREEN  |  [H] TOGGLE HUD  |  [C] CROSSHAIR"
@@ -331,6 +333,11 @@ def main():
         on_log=lambda m: print(f"[TELEM] {m}", flush=True),
     )
     telem_router.start()
+
+    # Zero-touch Vercel Discovery Registry Daemon:
+    # Registers GROUND-001 with current dynamic IPv6 and maintains 20s keep-alive heartbeat
+    registry_client = GroundStationRegistryClient(port=5005)
+    registry_client.start_background_daemon()
 
     latest_frame = [None]
     latest_stats = [None]
@@ -454,7 +461,8 @@ def main():
                 show_crosshair = not show_crosshair
 
     finally:
-        print("\nStopping receiver and telemetry router...", flush=True)
+        print("\nStopping receiver, telemetry router, and registry daemon...", flush=True)
+        registry_client.stop()
         receiver.stop()
         telem_router.stop()
         cv2.destroyAllWindows()

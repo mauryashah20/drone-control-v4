@@ -12,7 +12,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const { deviceId, ipv6, port, token } = req.body || {};
+    const rawDeviceId = req.body?.deviceId;
+    const deviceId = typeof rawDeviceId === "string" ? rawDeviceId.trim().toUpperCase().replace(/\s+/g, "") : "";
+    const { ipv6, port, token } = req.body || {};
 
     // 1. Validate deviceId
     if (!validateDeviceId(deviceId)) {

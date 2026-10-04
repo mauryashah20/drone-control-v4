@@ -34,6 +34,7 @@ class BluetoothTelemetryBridge(
     private val isRunning = AtomicBoolean(false)
 
     private var btSocket: BluetoothSocket? = null
+    private var connectingSocket: BluetoothSocket? = null
     private var udpSocket: DatagramSocket? = null
 
     private var btToUdpThread: Thread? = null
@@ -67,84 +68,91 @@ class BluetoothTelemetryBridge(
 
         // BT → UDP uplink thread (handles connect + reconnect internally)
         btToUdpThread = Thread({
-            val targetAddr = try { InetAddress.getByName(laptopIp) } catch (e: Exception) {
-                Log.e(TAG, "Bad laptop IP $laptopIp"); isRunning.set(false); return@Thread
-            }
-
-            // ── DIAGNOSTIC: dump every paired device once at startup ──────────
             try {
-                val adapter = BluetoothAdapter.getDefaultAdapter()
-                @Suppress("MissingPermission")
-                val bonded = adapter?.bondedDevices ?: emptySet()
-                if (bonded.isEmpty()) {
-                    Log.e(TAG, "DIAG: No paired BT devices found on this phone!")
-                } else {
-                    Log.e(TAG, "DIAG: Paired BT devices (${bonded.size}):")
-                    bonded.forEach { Log.e(TAG, "DIAG:   name='${it.name}'  addr=${it.address}") }
+                val targetAddr = try { InetAddress.getByName(laptopIp) } catch (e: Exception) {
+                    Log.e(TAG, "Bad laptop IP $laptopIp"); isRunning.set(false); return@Thread
                 }
-                Log.e(TAG, "DIAG: Looking for device named '$btDeviceName'")
-            } catch (e: Exception) {
-                Log.e(TAG, "DIAG: Failed to list devices — likely BLUETOOTH_CONNECT denied: ${e.message}")
-            }
-            // ─────────────────────────────────────────────────────────────────
 
-            while (isRunning.get()) {
-                val socket = connectBluetooth()
-                if (socket == null) {
-                    Thread.sleep(RECONNECT_DELAY_MS)
-                    continue
-                }
-                btSocket = socket
-                isConnected = true
-                Log.i(TAG, "BT connected to $btDeviceName — bridge live")
 
-                try {
-                    val input = socket.inputStream
-                    val buf = ByteArray(BUFFER_SIZE)
-                    while (isRunning.get()) {
-                        val n = input.read(buf)
-                        if (n <= 0) break
-                        // Forward raw MAVLink bytes to laptop via UDP
-                        val udp = udpSocket ?: break
-                        val pkt = DatagramPacket(buf, 0, n, targetAddr, laptopPort)
-                        udp.send(pkt)
-                        uplinkPackets.incrementAndGet()
-                        uplinkBytes.addAndGet(n.toLong())
+
+                while (isRunning.get() && !Thread.currentThread().isInterrupted) {
+                    val socket = connectBluetooth()
+                    if (socket == null) {
+                        try {
+                            Thread.sleep(RECONNECT_DELAY_MS)
+                        } catch (_: InterruptedException) {
+                            break
+                        }
+                        continue
                     }
-                } catch (e: Exception) {
-                    if (isRunning.get()) Log.w(TAG, "BT read error: ${e.message}")
-                } finally {
-                    isConnected = false
-                    try { socket.close() } catch (_: Exception) {}
-                    btSocket = null
-                    if (isRunning.get()) {
-                        Log.i(TAG, "BT disconnected — reconnecting in ${RECONNECT_DELAY_MS}ms")
-                        Thread.sleep(RECONNECT_DELAY_MS)
+                    btSocket = socket
+                    isConnected = true
+                    Log.i(TAG, "BT connected to $btDeviceName — bridge live")
+
+                    try {
+                        val input = socket.inputStream
+                        val buf = ByteArray(BUFFER_SIZE)
+                        while (isRunning.get() && !Thread.currentThread().isInterrupted) {
+                            val n = input.read(buf)
+                            if (n <= 0) break
+                            // Forward raw MAVLink bytes to laptop via UDP
+                            val udp = udpSocket ?: break
+                            val pkt = DatagramPacket(buf, 0, n, targetAddr, laptopPort)
+                            udp.send(pkt)
+                            uplinkPackets.incrementAndGet()
+                            uplinkBytes.addAndGet(n.toLong())
+                        }
+                    } catch (e: Exception) {
+                        if (isRunning.get()) Log.w(TAG, "BT read error: ${e.message}")
+                    } finally {
+                        isConnected = false
+                        try { socket.close() } catch (_: Exception) {}
+                        btSocket = null
+                        if (isRunning.get() && !Thread.currentThread().isInterrupted) {
+                            Log.i(TAG, "BT disconnected — reconnecting in ${RECONNECT_DELAY_MS}ms")
+                            try {
+                                Thread.sleep(RECONNECT_DELAY_MS)
+                            } catch (_: InterruptedException) {
+                                break
+                            }
+                        }
                     }
                 }
+            } catch (_: InterruptedException) {
+                // Thread interrupted cleanly on stop
+            } catch (t: Throwable) {
+                Log.e(TAG, "BT-Uplink thread error: ${t.message}", t)
+            } finally {
+                isConnected = false
             }
         }, "BT-Uplink").apply { priority = Thread.NORM_PRIORITY + 1; start() }
 
         // UDP → BT downlink thread (GCS commands from laptop back to APM via ESP32)
         udpToBtThread = Thread({
-            val buf = ByteArray(BUFFER_SIZE)
-            val pkt = DatagramPacket(buf, buf.size)
-            while (isRunning.get()) {
-                try {
-                    val udp = udpSocket ?: break
-                    udp.receive(pkt)
-                    val n = pkt.length
-                    if (n <= 0) continue
-                    val socket = btSocket
-                    if (socket != null && socket.isConnected) {
-                        socket.outputStream.write(buf, 0, n)
-                        socket.outputStream.flush()
-                        downlinkPackets.incrementAndGet()
-                        downlinkBytes.addAndGet(n.toLong())
+            try {
+                val buf = ByteArray(BUFFER_SIZE)
+                val pkt = DatagramPacket(buf, buf.size)
+                while (isRunning.get() && !Thread.currentThread().isInterrupted) {
+                    try {
+                        val udp = udpSocket ?: break
+                        udp.receive(pkt)
+                        val n = pkt.length
+                        if (n <= 0) continue
+                        val socket = btSocket
+                        if (socket != null && socket.isConnected) {
+                            socket.outputStream.write(buf, 0, n)
+                            socket.outputStream.flush()
+                            downlinkPackets.incrementAndGet()
+                            downlinkBytes.addAndGet(n.toLong())
+                        }
+                    } catch (e: Exception) {
+                        if (isRunning.get()) Log.w(TAG, "UDP recv error: ${e.message}")
                     }
-                } catch (e: Exception) {
-                    if (isRunning.get()) Log.w(TAG, "UDP recv error: ${e.message}")
                 }
+            } catch (_: InterruptedException) {
+                // Thread interrupted cleanly on stop
+            } catch (t: Throwable) {
+                Log.e(TAG, "BT-Downlink thread error: ${t.message}", t)
             }
         }, "BT-Downlink").apply { priority = Thread.NORM_PRIORITY + 1; start() }
 
@@ -182,11 +190,14 @@ class BluetoothTelemetryBridge(
                 device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
             }
 
+            connectingSocket = socket
             @Suppress("MissingPermission")
             adapter.cancelDiscovery()
             socket.connect()   // blocks until connected or throws
+            connectingSocket = null
             socket
         } catch (e: Exception) {
+            connectingSocket = null
             Log.w(TAG, "BT connect failed: ${e.message}")
             null
         }
@@ -196,8 +207,12 @@ class BluetoothTelemetryBridge(
     fun stop() {
         if (!isRunning.getAndSet(false)) return
         isConnected = false
+        try { connectingSocket?.close() } catch (_: Exception) {}
+        connectingSocket = null
         try { btSocket?.close() }   catch (_: Exception) {}
+        btSocket = null
         try { udpSocket?.close() }  catch (_: Exception) {}
+        udpSocket = null
         btToUdpThread?.interrupt()
         udpToBtThread?.interrupt()
         btToUdpThread = null

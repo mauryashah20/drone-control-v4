@@ -1,0 +1,21 @@
+{
+  "name": "drone-registry",
+  "version": "1.0.0",
+  "description": "IPv6 drone registration and discovery API for UAV LTE connectivity",
+  "scripts": {
+    "dev": "vercel dev",
+    "build": "tsc --noEmit",
+    "lint": "tsc --noEmit",
+    "gen-device": "ts-node --project tsconfig.scripts.json scripts/gen_device.ts"
+  },
+  "dependencies": {
+    "@vercel/postgres": "^0.10.0"
+  },
+  "devDependencies": {
+    "@vercel/node": "^3.0.0",
+    "typescript": "^5.4.0",
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.0",
+    "vercel": "^34.0.0"
+  }
+}

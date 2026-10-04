@@ -1,0 +1,18 @@
+[Unit]
+Description=Drone IPv6 Discovery and Dynamic Registration Service
+After=network-online.target systemd-networkd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/drone-client
+EnvironmentFile=/etc/drone-registry.env
+ExecStart=/usr/bin/python3 /home/pi/drone-client/drone_daemon.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

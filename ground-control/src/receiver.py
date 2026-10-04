@@ -105,8 +105,13 @@ class ZeroLatencyVideoReceiver:
         decoder = av.CodecContext.create("h264", "r")
         decoder.flags = av.codec.context.Flags.LOW_DELAY
         decoder.flags2 = av.codec.context.Flags2.FAST
-        decoder.thread_type = "SLICE"  # Never FRAME threading for live FPV
-        decoder.thread_count = 1       # 1 thread = 0 lookahead delay buffer
+        # FRAME threading: parallel decoding without intra-frame slice boundaries.
+        # SLICE mode creates the same tile-seam artifact as the encoder — visible
+        # horizontal lines where FFmpeg splits the frame for thread assignment.
+        # With FRAME mode and 2 threads the decoder works on whole frames in
+        # parallel and the deblocking filter runs uninterrupted across the full frame.
+        decoder.thread_type = "FRAME"
+        decoder.thread_count = 2
         return decoder
 
     def _reset_stream_state(self, reason: str = "") -> None:
@@ -354,6 +359,7 @@ class ZeroLatencyVideoReceiver:
 
                 # Convert to BGR for OpenCV / rendering
                 img = frame.to_ndarray(format="bgr24")
+
                 h, w = img.shape[:2]
 
                 self._total_frames += 1

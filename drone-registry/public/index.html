@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Drone IPv6 Registry & Discovery</title>
+  <style>
+    :root {
+      --bg: #090a0f;
+      --card: #12151f;
+      --border: #1e2433;
+      --accent: #00f0ff;
+      --text: #e2e8f0;
+      --muted: #64748b;
+      --green: #10b981;
+    }
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+    }
+    .container {
+      max-width: 600px;
+      width: 90%;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 32px;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 12px;
+      border-radius: 9999px;
+      background: rgba(16, 185, 129, 0.15);
+      color: var(--green);
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 16px;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 10px var(--green);
+    }
+    h1 {
+      margin: 0 0 8px 0;
+      font-size: 24px;
+      color: #fff;
+    }
+    p {
+      color: var(--muted);
+      line-height: 1.5;
+      margin: 0 0 24px 0;
+    }
+    .endpoints {
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      font-family: monospace;
+      font-size: 13px;
+    }
+    .endpoint {
+      margin-bottom: 8px;
+      display: flex;
+      justify-content: space-between;
+    }
+    .endpoint:last-child {
+      margin-bottom: 0;
+    }
+    .method {
+      color: var(--accent);
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="badge"><span class="dot"></span> Discovery API Active</div>
+    <h1>Drone IPv6 Discovery Registry</h1>
+    <p>Serverless endpoint for UAV dynamic IPv6 registration and ground station discovery. Drone ↔ Ground Station data streams directly over peer-to-peer IPv6.</p>
+    <div class="endpoints">
+      <div class="endpoint"><span><span class="method">POST</span> /api/register</span><span>Register / Re-register IP</span></div>
+      <div class="endpoint"><span><span class="method">GET</span> /api/lookup?deviceId=...</span><span>Discover Drone Target</span></div>
+      <div class="endpoint"><span><span class="method">POST</span> /api/heartbeat</span><span>Keep-Alive Pulse</span></div>
+      <div class="endpoint"><span><span class="method">GET</span> /api/health</span><span>Status Health Probe</span></div>
+    </div>
+  </div>
+</body>
+</html>

@@ -7,6 +7,7 @@
     android:layout_height="match_parent"
     android:background="@color/black_pitch"
     android:fillViewport="true"
+    android:fitsSystemWindows="true"
     tools:context=".MainActivity">
 
     <androidx.constraintlayout.widget.ConstraintLayout
@@ -207,6 +208,48 @@
                     android:fontFamily="monospace"
                     android:letterSpacing="0.05"
                     android:layout_marginBottom="10dp" />
+
+                <!-- Vercel Cloud Discovery & Registration -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:layout_marginBottom="10dp"
+                    android:gravity="center_vertical">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_register_drone"
+                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="38dp"
+                        android:layout_weight="1"
+                        android:text="REGISTER DRONE IP"
+                        android:textColor="@color/neon_green"
+                        android:textSize="9sp"
+                        android:textStyle="bold"
+                        android:fontFamily="monospace"
+                        android:padding="0dp"
+                        app:strokeColor="@color/neon_green"
+                        app:strokeWidth="1dp"
+                        app:cornerRadius="6dp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_discover_target"
+                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="38dp"
+                        android:layout_weight="1"
+                        android:layout_marginStart="8dp"
+                        android:text="SYNC FROM VERCEL"
+                        android:textColor="@color/gold_bright"
+                        android:textSize="9sp"
+                        android:textStyle="bold"
+                        android:fontFamily="monospace"
+                        android:padding="0dp"
+                        app:strokeColor="@color/gold_bright"
+                        app:strokeWidth="1dp"
+                        app:cornerRadius="6dp" />
+                </LinearLayout>
 
                 <!-- Target IP & Port -->
                 <LinearLayout

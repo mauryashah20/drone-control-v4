@@ -34,6 +34,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvStatusDetail: TextView
     private lateinit var viewStatusIndicator: View
     private lateinit var btnToggleStream: com.google.android.material.button.MaterialButton
+    private lateinit var btnRegisterDrone: com.google.android.material.button.MaterialButton
+    private lateinit var btnDiscoverTarget: com.google.android.material.button.MaterialButton
 
     // Telemetry UI Elements
     private lateinit var cbEnableTelem: CheckBox
@@ -76,6 +78,10 @@ class MainActivity : AppCompatActivity() {
                     tvTelemStatus.text = "OFF"
                     tvTelemStatus.setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_dim))
                 }
+            } else if (intent?.action == StreamingService.ACTION_STREAMING_STOPPED) {
+                if (isStreaming) {
+                    updateUiStopped()
+                }
             }
         }
     }
@@ -92,6 +98,7 @@ class MainActivity : AppCompatActivity() {
         initViews()
         loadPreferences()
         checkPermissions()
+        startAutomaticRegistrySync()
     }
 
     private fun initViews() {
@@ -115,6 +122,38 @@ class MainActivity : AppCompatActivity() {
         tvStatusDetail = findViewById(R.id.tv_status_detail)
         viewStatusIndicator = findViewById(R.id.view_status_indicator)
         btnToggleStream = findViewById(R.id.btn_toggle_stream)
+
+        btnRegisterDrone = findViewById(R.id.btn_register_drone)
+        btnDiscoverTarget = findViewById(R.id.btn_discover_target)
+
+        btnRegisterDrone.setOnClickListener {
+            btnRegisterDrone.isEnabled = false
+            btnRegisterDrone.text = "REGISTERING..."
+            val port = etTargetPort.text.toString().trim().toIntOrNull() ?: 5005
+            DroneRegistryManager.registerDrone(port = port) { success, msg, detectedIp ->
+                btnRegisterDrone.isEnabled = true
+                btnRegisterDrone.text = "REGISTER DRONE IP"
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                if (success && detectedIp != null) {
+                    tvStatusDetail.text = "Drone registered on Vercel: [$detectedIp]:$port"
+                }
+            }
+        }
+
+        btnDiscoverTarget.setOnClickListener {
+            btnDiscoverTarget.isEnabled = false
+            btnDiscoverTarget.text = "LOOKING UP..."
+            DroneRegistryManager.lookupTarget(deviceId = "GROUND-001") { success, ipv6, port, isOnline, msg ->
+                btnDiscoverTarget.isEnabled = true
+                btnDiscoverTarget.text = "SYNC FROM VERCEL"
+                Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+                if (success && ipv6 != null) {
+                    etTargetIp.setText(ipv6)
+                    saveCurrentPreferences()
+                    updateIdleStatusDetail()
+                }
+            }
+        }
 
         cbEnableTelem = findViewById(R.id.cb_enable_telem)
         etEspIp = findViewById(R.id.et_esp_ip)
@@ -193,6 +232,8 @@ class MainActivity : AppCompatActivity() {
         rbFps60.isEnabled = enabled
         rbFps30.isEnabled = enabled
         cbEnableTelem.isEnabled = enabled
+        btnRegisterDrone.isEnabled = enabled
+        btnDiscoverTarget.isEnabled = enabled
 
         if (enabled) {
             val telemEnabled = cbEnableTelem.isChecked
@@ -236,12 +277,15 @@ class MainActivity : AppCompatActivity() {
 
         saveCurrentPreferences()
 
+        // Auto-register drone to Vercel discovery registry so Ground Station can always find it
+        DroneRegistryManager.registerDrone(port = port) { _, _, _ -> }
+
         val fps = if (rbFps60.isChecked) 60 else 30
         val isAuto = rbAuto.isChecked
 
         val (width, height, bitrate) = when {
             isAuto -> {
-                // Auto mode starts with balanced 480p @ 600 kbps, dynamically adapts based on latency
+                // Auto mode: balanced 480p, dynamically adapts based on latency
                 val br = if (fps == 60) 700_000 else 500_000
                 Triple(640, 480, br)
             }
@@ -278,6 +322,9 @@ class MainActivity : AppCompatActivity() {
         isStreaming = true
         setConfigControlsEnabled(false)
 
+        btnToggleStream.isEnabled = false
+        btnToggleStream.postDelayed({ btnToggleStream.isEnabled = true }, 600)
+
         btnToggleStream.text = "ABORT // STOP STREAMING"
         btnToggleStream.strokeColor = ContextCompat.getColorStateList(this, R.color.neon_red)
         btnToggleStream.setTextColor(ContextCompat.getColor(this, R.color.neon_red))
@@ -288,13 +335,26 @@ class MainActivity : AppCompatActivity() {
         viewStatusIndicator.setBackgroundResource(R.drawable.dot_neon_green)
         val modeDesc = if (isAuto) "Auto Quality" else "${width}x${height}"
         tvStatusDetail.text = "Direct Qualcomm AVC pipe active • $modeDesc @ ${fps}fps to $ip:$port"
+
+        // Give the app exclusive focus of all phone resources
+        enterFocusMode()
     }
 
     private fun stopStream() {
+        btnToggleStream.isEnabled = false
+        btnToggleStream.text = "STOPPING..."
+        btnToggleStream.postDelayed({ btnToggleStream.isEnabled = true }, 600)
+
         val serviceIntent = Intent(this, StreamingService::class.java).apply {
             action = StreamingService.ACTION_STOP
         }
         startService(serviceIntent)
+
+        updateUiStopped()
+    }
+
+    private fun updateUiStopped() {
+        exitFocusMode()
 
         isStreaming = false
         setConfigControlsEnabled(true)
@@ -311,6 +371,21 @@ class MainActivity : AppCompatActivity() {
 
         tvFpsLive.text = "0.0 fps"
         tvBitrate.text = "0 kbps"
+    }
+
+    // ─── Performance Mode: optimize device clocks during active stream ────────
+
+    private fun enterFocusMode() {
+        // Sustained Performance Mode: locks SoC clocks at stable level to prevent thermal throttling
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try { window.setSustainedPerformanceMode(true) } catch (_: Exception) {}
+        }
+    }
+
+    private fun exitFocusMode() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try { window.setSustainedPerformanceMode(false) } catch (_: Exception) {}
+        }
     }
 
     private fun checkPermissions() {
@@ -387,7 +462,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        val filter = IntentFilter(StreamingService.ACTION_STATS_BROADCAST)
+        val filter = IntentFilter().apply {
+            addAction(StreamingService.ACTION_STATS_BROADCAST)
+            addAction(StreamingService.ACTION_STREAMING_STOPPED)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(statsReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
@@ -411,7 +489,17 @@ class MainActivity : AppCompatActivity() {
         super.onBackPressed()
     }
 
+    private fun startAutomaticRegistrySync() {
+        val port = etTargetPort.text.toString().trim().toIntOrNull() ?: 5005
+        DroneRegistryManager.startAutoSync(applicationContext, port = port) { msg, _ ->
+            if (!isStreaming) {
+                tvStatusDetail.text = msg
+            }
+        }
+    }
+
     override fun onDestroy() {
+        DroneRegistryManager.stopAutoSync(applicationContext)
         if (isStreaming) {
             stopStream()
         }

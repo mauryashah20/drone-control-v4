@@ -50,3 +50,13 @@ desktop.ini
 *~
 .vscode/
 **/.vscode/
+
+# Node & Vercel
+node_modules/
+**/node_modules/
+.vercel/
+**/.vercel/
+.env
+.env.local
+*.log
+

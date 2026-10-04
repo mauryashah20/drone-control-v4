@@ -208,6 +208,7 @@ class StreamingService : Service() {
                 udpSocket = DatagramSocket()
                 udpTarget = InetSocketAddress(targetIp, targetPort)
 
+                startUdpCommandListener(udpSocket!!)
                 sendControlPacket(PACKET_HELLO, 3)
 
                 getCameraHandler().post {
@@ -270,7 +271,9 @@ class StreamingService : Service() {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, targetBitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, targetFps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            // 60-second I-frame interval: eliminates periodic 1-2s IDR keyframe burst spikes.
+            // Intra-refresh smoothly updates macroblocks every frame instead.
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 60)
 
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
             setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
@@ -287,7 +290,10 @@ class StreamingService : Service() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 try { setInteger(MediaFormat.KEY_INTRA_REFRESH_PERIOD, targetFps) } catch (_: Exception) {}
             }
-            try { setInteger("vendor.qti-ext-enc-intra-refresh.period", targetFps) } catch (_: Exception) {}
+            try {
+                setInteger("vendor.qti-ext-enc-intra-refresh.mode", 1) // Cyclic column/row refresh
+                setInteger("vendor.qti-ext-enc-intra-refresh.period", targetFps)
+            } catch (_: Exception) {}
 
             // 3. Android Low-latency & zero-lookahead flags
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -463,7 +469,7 @@ class StreamingService : Service() {
             set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
             set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF)
 
-            set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
 
             set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_FAST)
             set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_FAST)
@@ -615,6 +621,37 @@ class StreamingService : Service() {
         sendControlPacket(PACKET_KEEP_ALIVE, 1)
     }
 
+    private fun startUdpCommandListener(socket: DatagramSocket) {
+        val exec = Executors.newSingleThreadExecutor()
+        exec.execute {
+            val buf = ByteArray(64)
+            val packet = DatagramPacket(buf, buf.size)
+            while (isStreaming.get() && udpSocket == socket) {
+                try {
+                    socket.receive(packet)
+                    if (packet.length >= 2) {
+                        // 0xFF 0x02: Keyframe request from laptop receiver
+                        if (buf[0] == 0xFF.toByte() && buf[1] == 0x02.toByte()) {
+                            Log.i(TAG, "Sync IDR frame requested by laptop receiver")
+                            requestSyncFrame()
+                        }
+                    }
+                } catch (_: Exception) {
+                    break
+                }
+            }
+        }
+    }
+
+    private fun requestSyncFrame() {
+        try {
+            val params = android.os.Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            }
+            encoder?.setParameters(params)
+        } catch (_: Exception) {}
+    }
+
     /**
      * Chunk and transmit NAL units over UDP with 16-byte robust header
      */
@@ -644,6 +681,11 @@ class StreamingService : Service() {
                 socket.send(packet)
                 packetsCount++
             } catch (_: Exception) {}
+
+            // Micro-pacing for multi-chunk bursts (prevents LTE modem transport block queuing delay)
+            if (totalChunks > 3 && (chunkIdx and 1 == 1)) {
+                java.util.concurrent.locks.LockSupport.parkNanos(35_000L) // 35 microseconds
+            }
         }
 
         return packetsCount

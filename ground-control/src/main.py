@@ -323,6 +323,14 @@ def main():
     print(" Mission Planner TCP Fallback:     TCP 127.0.0.1:5760", flush=True)
     print("=" * 65, flush=True)
 
+    # Set Windows kernel timer resolution to 1ms to eliminate cv2.waitKey 15.6ms jitter
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.winmm.timeBeginPeriod(1)
+        except Exception:
+            pass
+
     # Initialize Telemetry Router
     telem_router = TelemetryRouter(
         phone_bind_ip="0.0.0.0",
@@ -393,8 +401,8 @@ def main():
                 now_perf = time.time()
                 now_ms = int(now_perf * 1000)
 
-                # Compute and refresh Glass-to-Glass latency every 500ms
-                if now_perf - last_g2g_update_time[0] >= 0.5:
+                # Compute and refresh Glass-to-Glass latency every 200ms with EMA smoothing
+                if now_perf - last_g2g_update_time[0] >= 0.2:
                     if stats.sender_timestamp_ms > 0:
                         raw_diff = float(now_ms - stats.sender_timestamp_ms)
 
@@ -405,10 +413,17 @@ def main():
 
                         # If clock skew is detected (negative or large constant offset)
                         if min_observed_diff[0] is not None and (raw_diff < 0 or raw_diff > 3000):
-                            skew_correction = min_observed_diff[0] - 85.0
-                            latest_g2g_latency[0] = max(25.0, raw_diff - skew_correction)
+                            skew_correction = min_observed_diff[0] - 45.0
+                            instant_lat = max(15.0, raw_diff - skew_correction)
                         else:
-                            latest_g2g_latency[0] = max(20.0, raw_diff)
+                            instant_lat = max(15.0, raw_diff)
+
+                        # Exponential Moving Average filter (prevents single-frame jitter spike)
+                        if latest_g2g_latency[0] <= 0:
+                            latest_g2g_latency[0] = instant_lat
+                        else:
+                            alpha = 0.35 if instant_lat > latest_g2g_latency[0] else 0.20
+                            latest_g2g_latency[0] = (alpha * instant_lat) + ((1.0 - alpha) * latest_g2g_latency[0])
 
                     last_g2g_update_time[0] = now_perf
                     receiver.send_feedback(latest_g2g_latency[0])
@@ -466,6 +481,12 @@ def main():
         receiver.stop()
         telem_router.stop()
         cv2.destroyAllWindows()
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.winmm.timeEndPeriod(1)
+            except Exception:
+                pass
         print("Done. Clean exit.", flush=True)
 
 

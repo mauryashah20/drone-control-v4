@@ -2,6 +2,7 @@ import socket
 import struct
 import threading
 import time
+import queue
 from dataclasses import dataclass
 from typing import Callable, Optional, Dict
 import av
@@ -62,6 +63,8 @@ class ZeroLatencyVideoReceiver:
 
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
+        self._decode_thread: Optional[threading.Thread] = None
+        self._decode_queue: queue.Queue = queue.Queue(maxsize=2)
         self._running = threading.Event()
         self._lock = threading.Lock()
 
@@ -105,13 +108,9 @@ class ZeroLatencyVideoReceiver:
         decoder = av.CodecContext.create("h264", "r")
         decoder.flags = av.codec.context.Flags.LOW_DELAY
         decoder.flags2 = av.codec.context.Flags2.FAST
-        # FRAME threading: parallel decoding without intra-frame slice boundaries.
-        # SLICE mode creates the same tile-seam artifact as the encoder — visible
-        # horizontal lines where FFmpeg splits the frame for thread assignment.
-        # With FRAME mode and 2 threads the decoder works on whole frames in
-        # parallel and the deblocking filter runs uninterrupted across the full frame.
-        decoder.thread_type = "FRAME"
-        decoder.thread_count = 2
+        # Single-thread: avoids FFmpeg multi-frame worker pipeline delay (decodes 640x480 in <1ms)
+        decoder.thread_type = "NONE"
+        decoder.thread_count = 1
         return decoder
 
     def _reset_stream_state(self, reason: str = "") -> None:
@@ -152,6 +151,7 @@ class ZeroLatencyVideoReceiver:
                 self._reset_stream_state("reconnect")
                 sender_str = f"{addr[0]}:{addr[1]}"
                 self._log(f"[LINK CONNECTED] Stream linked with {sender_str} ({reason})")
+                self.request_sync_frame()
                 if self.on_connection_change:
                     try:
                         self.on_connection_change(True, reason, sender_str)
@@ -173,6 +173,14 @@ class ZeroLatencyVideoReceiver:
                     except Exception as e:
                         self._log(f"[WARN] Disconnection callback error: {e}")
 
+    def request_sync_frame(self) -> None:
+        """Sends an on-demand IDR keyframe request to the transmitter over UDP."""
+        if self._sock and self._last_sender_addr:
+            try:
+                self._sock.sendto(b"\xFF\x02", self._last_sender_addr)
+            except Exception:
+                pass
+
     def send_feedback(self, latency_ms: float) -> None:
         """Sends latency feedback back to transmitter for dynamic quality scaling."""
         if self._sock and self._last_sender_addr and self.is_connected:
@@ -189,6 +197,8 @@ class ZeroLatencyVideoReceiver:
         self._running.set()
         self._thread = threading.Thread(target=self._recv_loop, daemon=True, name="UDP-Receiver-Thread")
         self._thread.start()
+        self._decode_thread = threading.Thread(target=self._decode_worker, daemon=True, name="H264-Decoder-Thread")
+        self._decode_thread.start()
         self._log(f"Receiver listening on {self.bind_ip}:{self.port}")
 
     def stop(self) -> None:
@@ -198,6 +208,9 @@ class ZeroLatencyVideoReceiver:
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
+        if self._decode_thread is not None:
+            self._decode_thread.join(timeout=1.0)
+            self._decode_thread = None
         self._close_socket()
         self._log("Receiver stopped")
 
@@ -340,7 +353,29 @@ class ZeroLatencyVideoReceiver:
                             self._dropped_frames += gap
 
                     self._last_completed_seq = frame_seq
-                    self._process_frame(frame_seq, full_frame, frame_ts)
+
+                    # Non-blocking handoff to decoder thread (drops stale frame if decoder is busy)
+                    try:
+                        if self._decode_queue.full():
+                            try:
+                                self._decode_queue.get_nowait()
+                                self._dropped_frames += 1
+                            except queue.Empty:
+                                pass
+                        self._decode_queue.put_nowait((frame_seq, full_frame, frame_ts))
+                    except Exception:
+                        pass
+
+    def _decode_worker(self) -> None:
+        """Dedicated decoding worker running off the UDP network socket thread."""
+        while self._running.is_set():
+            try:
+                item = self._decode_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            frame_seq, full_frame, frame_ts = item
+            self._process_frame(frame_seq, full_frame, frame_ts)
 
     def _process_frame(self, seq: int, raw_bytes: bytes, sender_ts_ms: int) -> None:
         t_decode_start = time.perf_counter()

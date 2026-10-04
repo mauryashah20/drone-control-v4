@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import collections
 from typing import Optional
 import cv2
 import numpy as np
@@ -353,14 +354,51 @@ def main():
     show_hud = True
     show_crosshair = True
 
-    # Glass-to-Glass tracking (500ms update cycle)
-    latest_g2g_latency = [0.0]
-    last_g2g_update_time = [0.0]
+    # 2-Second Moving Average Latency Tracker (pure rolling window, zero stickiness)
+    latency_samples = collections.deque()
     min_observed_diff = [None]
+    min_observed_time = [0.0]
+    avg_latency_2s = [0.0]
+    last_feedback_time = [0.0]
+
+    def record_latency(sender_ts_ms: int):
+        if sender_ts_ms <= 0:
+            return
+        now_perf = time.time()
+        now_ms = int(now_perf * 1000)
+        raw_diff = float(now_ms - sender_ts_ms)
+
+        # Baseline calibration (tracks minimum physical transit + clock offset)
+        # Periodically refresh minimum every 60s so it smoothly adapts to slow clock drift
+        if min_observed_diff[0] is None or raw_diff < min_observed_diff[0] or (now_perf - min_observed_time[0] > 60.0):
+            min_observed_diff[0] = raw_diff
+            min_observed_time[0] = now_perf
+
+        # Estimated one-way latency: baseline (~40ms) + transit / queuing delay
+        instant_lat = max(15.0, 40.0 + (raw_diff - min_observed_diff[0]))
+
+        # Add to rolling window
+        latency_samples.append((now_perf, instant_lat))
+
+        # Evict samples older than 2.0 seconds
+        cutoff = now_perf - 2.0
+        while latency_samples and latency_samples[0][0] < cutoff:
+            latency_samples.popleft()
+
+    def get_2s_avg_latency() -> float:
+        now_perf = time.time()
+        cutoff = now_perf - 2.0
+        while latency_samples and latency_samples[0][0] < cutoff:
+            latency_samples.popleft()
+        if not latency_samples:
+            return 0.0
+        return sum(l for _, l in latency_samples) / len(latency_samples)
 
     def on_frame_callback(frame: np.ndarray, stats: FrameStats):
         latest_frame[0] = frame
         latest_stats[0] = stats
+        if stats.sender_timestamp_ms > 0:
+            record_latency(stats.sender_timestamp_ms)
 
     def on_connection_callback(connected: bool, reason: str, sender_str: Optional[str]):
         if not connected:
@@ -368,10 +406,13 @@ def main():
             latest_frame[0] = None
             latest_stats[0] = None
             min_observed_diff[0] = None
-            latest_g2g_latency[0] = 0.0
+            latency_samples.clear()
+            avg_latency_2s[0] = 0.0
         else:
             # Fresh connection established: ready for new stream calibration
             min_observed_diff[0] = None
+            latency_samples.clear()
+            avg_latency_2s[0] = 0.0
 
     receiver = ZeroLatencyVideoReceiver(
         bind_ip="0.0.0.0",
@@ -399,34 +440,11 @@ def main():
 
             if is_connected and frame is not None and stats is not None:
                 now_perf = time.time()
-                now_ms = int(now_perf * 1000)
+                avg_latency_2s[0] = get_2s_avg_latency()
 
-                # Compute and refresh Glass-to-Glass latency every 200ms with EMA smoothing
-                if now_perf - last_g2g_update_time[0] >= 0.2:
-                    if stats.sender_timestamp_ms > 0:
-                        raw_diff = float(now_ms - stats.sender_timestamp_ms)
-
-                        # Automatic clock skew calibration between phone and laptop
-                        if min_observed_diff[0] is None or raw_diff < min_observed_diff[0]:
-                            if -60000 < raw_diff < 60000:
-                                min_observed_diff[0] = raw_diff
-
-                        # If clock skew is detected (negative or large constant offset)
-                        if min_observed_diff[0] is not None and (raw_diff < 0 or raw_diff > 3000):
-                            skew_correction = min_observed_diff[0] - 45.0
-                            instant_lat = max(15.0, raw_diff - skew_correction)
-                        else:
-                            instant_lat = max(15.0, raw_diff)
-
-                        # Exponential Moving Average filter (prevents single-frame jitter spike)
-                        if latest_g2g_latency[0] <= 0:
-                            latest_g2g_latency[0] = instant_lat
-                        else:
-                            alpha = 0.35 if instant_lat > latest_g2g_latency[0] else 0.20
-                            latest_g2g_latency[0] = (alpha * instant_lat) + ((1.0 - alpha) * latest_g2g_latency[0])
-
-                    last_g2g_update_time[0] = now_perf
-                    receiver.send_feedback(latest_g2g_latency[0])
+                if now_perf - last_feedback_time[0] >= 0.2:
+                    last_feedback_time[0] = now_perf
+                    receiver.send_feedback(avg_latency_2s[0])
 
                 telem_state = telem_router.get_state()
 
@@ -434,7 +452,7 @@ def main():
                     display_frame = draw_hud(
                         frame.copy(),
                         stats,
-                        latest_g2g_latency[0],
+                        avg_latency_2s[0],
                         sender_str=receiver.last_sender_str,
                         telem=telem_state,
                         show_crosshair=show_crosshair,

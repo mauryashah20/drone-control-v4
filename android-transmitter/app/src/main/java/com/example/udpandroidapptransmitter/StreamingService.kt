@@ -205,7 +205,13 @@ class StreamingService : Service() {
             } catch (_: Exception) {}
 
             try {
-                udpSocket = DatagramSocket()
+                udpSocket = DatagramSocket().apply {
+                    try {
+                        // Pure FPV: Small socket send buffer (32KB) prevents Android OS kernel
+                        // from queueing stale video packets during cellular jitter bursts
+                        sendBufferSize = 32 * 1024
+                    } catch (_: Exception) {}
+                }
                 udpTarget = InetSocketAddress(targetIp, targetPort)
 
                 startUdpCommandListener(udpSocket!!)
@@ -275,7 +281,10 @@ class StreamingService : Service() {
             // Intra-refresh smoothly updates macroblocks every frame instead.
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 60)
 
-            setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+            // Pure FPV: VBR (Variable Bitrate) mode - ZERO buffer smoothing, zero lookahead delay!
+            // CBR mode forces the encoder to buffer frames to smooth the bit stream.
+            // VBR encodes each frame immediately without HRD/VBV buffer latency.
+            setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
             setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
             setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
             setInteger(MediaFormat.KEY_PRIORITY, 0) // Real-time priority
@@ -542,10 +551,8 @@ class StreamingService : Service() {
         var framesSentSinceReport: Long = 0
         var lastStatsTime = System.currentTimeMillis()
         var lastPacketSentTime = System.currentTimeMillis()
-        // 4ms dequeue timeout: thread sleeps in kernel between checks (no CPU spin)
-        // but wakes up within 4ms of a frame becoming ready — vs up to 33ms at 30fps
-        // with the old full-frame-period timeout. Saves ~8-12ms of drain latency.
-        val dequeueTimeoutUs = 4_000L
+        // 2ms dequeue timeout: wakes up within 2ms of frame ready without CPU spin
+        val dequeueTimeoutUs = 2_000L
 
         while (isStreaming.get() && encoder == codec) {
             try {
@@ -557,24 +564,45 @@ class StreamingService : Service() {
                 val now = System.currentTimeMillis()
 
                 if (outIndex >= 0) {
+                    // Pure FPV: If multiple frames backed up in the encoder queue,
+                    // drop stale older frames immediately so the cellular modem NEVER transmits old video!
+                    var latestIndex = outIndex
+                    var latestOffset = bufferInfo.offset
+                    var latestSize = bufferInfo.size
+
+                    while (true) {
+                        val nextIndex = try {
+                            codec.dequeueOutputBuffer(bufferInfo, 0L)
+                        } catch (_: Exception) { -1 }
+
+                        if (nextIndex >= 0) {
+                            try { codec.releaseOutputBuffer(latestIndex, false) } catch (_: Exception) {}
+                            latestIndex = nextIndex
+                            latestOffset = bufferInfo.offset
+                            latestSize = bufferInfo.size
+                        } else {
+                            break
+                        }
+                    }
+
                     val encodedBuffer = try {
-                        codec.getOutputBuffer(outIndex)
+                        codec.getOutputBuffer(latestIndex)
                     } catch (_: Exception) {
                         null
                     }
-                    if (encodedBuffer != null && bufferInfo.size > 0) {
-                        encodedBuffer.position(bufferInfo.offset)
-                        encodedBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                    if (encodedBuffer != null && latestSize > 0) {
+                        encodedBuffer.position(latestOffset)
+                        encodedBuffer.limit(latestOffset + latestSize)
 
                         val pkts = sendDirectChunkedUdp(encodedBuffer, sequence)
                         packetsSentSinceReport += pkts
-                        bytesSentSinceReport += bufferInfo.size
+                        bytesSentSinceReport += latestSize
                         framesSentSinceReport += 1
                         sequence++
                         lastPacketSentTime = now
                     }
                     try {
-                        codec.releaseOutputBuffer(outIndex, false)
+                        codec.releaseOutputBuffer(latestIndex, false)
                     } catch (_: Exception) {}
                 } else if (outIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
                     // Timed out with no frame — only send keep-alive every 80ms

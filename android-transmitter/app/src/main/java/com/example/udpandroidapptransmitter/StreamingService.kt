@@ -58,6 +58,7 @@ class StreamingService : Service() {
         const val EXTRA_BITRATE = "bitrate"
         const val EXTRA_AUTO_QUALITY = "auto_quality"
         const val EXTRA_AUTO_CONTRAST = "auto_contrast"
+        const val EXTRA_CODEC = "codec"
 
         const val EXTRA_LIVE_FPS = "live_fps"
         const val EXTRA_LIVE_KBPS = "live_kbps"
@@ -99,11 +100,12 @@ class StreamingService : Service() {
     // Stream Configuration
     private var targetWidth = 640
     private var targetHeight = 480
-    private var targetFps = 30
-    private var targetBitrate = 700_000
+    private var targetFps = 60
+    private var targetBitrate = 1_500_000
+    private var targetCodec = "hevc"
     private var isAutoQuality = true
     private var isAutoContrast = true
-    private var currentBitrate = 700_000
+    private var currentBitrate = 1_500_000
     private var targetIp = "2401:4900:8f73:7949:8fa7:f1ad:81c1:b5b2"
     private var targetPort = 5005
 
@@ -193,8 +195,9 @@ class StreamingService : Service() {
             targetPort = intent?.getIntExtra(EXTRA_TARGET_PORT, 5005) ?: 5005
             targetWidth = intent?.getIntExtra(EXTRA_WIDTH, 640) ?: 640
             targetHeight = intent?.getIntExtra(EXTRA_HEIGHT, 480) ?: 480
-            targetFps = intent?.getIntExtra(EXTRA_FPS, 30) ?: 30
-            targetBitrate = intent?.getIntExtra(EXTRA_BITRATE, 700_000) ?: 700_000
+            targetFps = intent?.getIntExtra(EXTRA_FPS, 60) ?: 60
+            targetBitrate = intent?.getIntExtra(EXTRA_BITRATE, 1_500_000) ?: 1_500_000
+            targetCodec = intent?.getStringExtra(EXTRA_CODEC) ?: "hevc"
             isAutoQuality = intent?.getBooleanExtra(EXTRA_AUTO_QUALITY, true) ?: true
             isAutoContrast = intent?.getBooleanExtra(EXTRA_AUTO_CONTRAST, true) ?: true
             currentBitrate = targetBitrate
@@ -285,7 +288,29 @@ class StreamingService : Service() {
         }
     }
 
-    private fun createBestQualcommEncoder(): MediaCodec {
+    private fun createBestQualcommEncoder(codecType: String): Pair<MediaCodec, String> {
+        if (codecType.equals("hevc", ignoreCase = true)) {
+            val candidateNames = listOf(
+                "c2.qti.hevc.encoder.low_latency",
+                "c2.qti.hevc.encoder",
+                "OMX.qcom.video.encoder.hevc"
+            )
+            for (name in candidateNames) {
+                try {
+                    val codec = MediaCodec.createByCodecName(name)
+                    Log.i(TAG, "Selected optimized Qualcomm hardware HEVC encoder: $name")
+                    return Pair(codec, MediaFormat.MIMETYPE_VIDEO_HEVC)
+                } catch (_: Exception) {}
+            }
+            try {
+                val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_HEVC)
+                Log.i(TAG, "Selected default HEVC encoder")
+                return Pair(codec, MediaFormat.MIMETYPE_VIDEO_HEVC)
+            } catch (e: Exception) {
+                Log.w(TAG, "HEVC unavailable, falling back to AVC: ${e.message}")
+            }
+        }
+
         val candidateNames = listOf(
             "c2.qti.avc.encoder.low_latency",
             "c2.qti.avc.encoder",
@@ -294,21 +319,23 @@ class StreamingService : Service() {
         for (name in candidateNames) {
             try {
                 val codec = MediaCodec.createByCodecName(name)
-                Log.i(TAG, "Selected optimized Qualcomm hardware encoder: $name")
-                return codec
+                Log.i(TAG, "Selected optimized Qualcomm hardware AVC encoder: $name")
+                return Pair(codec, MediaFormat.MIMETYPE_VIDEO_AVC)
             } catch (_: Exception) {}
         }
         Log.i(TAG, "Falling back to default AVC encoder")
-        return MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        return Pair(MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC), MediaFormat.MIMETYPE_VIDEO_AVC)
     }
 
     private fun setupHardwareEncoder() {
-        Log.i(TAG, "Configuring Qualcomm Hardware AVC Encoder: ${targetWidth}x${targetHeight} @ ${targetFps}fps, ${targetBitrate / 1000}kbps")
+        Log.i(TAG, "Configuring Qualcomm Hardware Video Encoder: ${targetWidth}x${targetHeight} @ ${targetFps}fps, ${targetBitrate / 1000}kbps, codec=$targetCodec")
 
         // Release any existing encoder instance before creating a new one
         stopHardwareEncoder()
 
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, targetWidth, targetHeight).apply {
+        val (codec, mimeType) = createBestQualcommEncoder(targetCodec)
+
+        val format = MediaFormat.createVideoFormat(mimeType, targetWidth, targetHeight).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, targetBitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, targetFps)
@@ -318,14 +345,21 @@ class StreamingService : Service() {
             // Pure FPV: CBR (Constant Bitrate) mode prevents sudden burst spikes that cause cellular bufferbloat!
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
 
-            // High Profile enables 8x8 DCT transform & CABAC entropy coding (eliminates blocky 4x4 macroblocks)
-            try {
-                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
-                setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel4)
-            } catch (_: Exception) {
-                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
-                setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
+            if (mimeType == MediaFormat.MIMETYPE_VIDEO_HEVC) {
+                try {
+                    setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain)
+                    setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel41)
+                } catch (_: Exception) {}
+            } else {
+                try {
+                    setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
+                    setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel4)
+                } catch (_: Exception) {
+                    setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+                    setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
+                }
             }
+
             setInteger(MediaFormat.KEY_PRIORITY, 0) // Real-time priority
 
             // 1. VPU clock governor boost: force Qualcomm VPU to run at maximum operating frequency
@@ -353,34 +387,25 @@ class StreamingService : Service() {
                 setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
             }
 
-            // 4. Qualcomm hardware low-latency & slice delivery extensions
+            // 4. Qualcomm hardware low-latency extensions
             try { setInteger("vendor.qti-ext-enc-low-latency.enable", 1) } catch (_: Exception) {}
-            try { setInteger("vendor.qti-ext-enc-slice-delivery-mode.enable", 1) } catch (_: Exception) {}
 
-            // 5. Initial QP override: start at crisp quality immediately
+            // 5. Qualcomm Intra-refresh: smooth macroblock refreshes with 0ms burst spikes
+            try { setInteger("vendor.qti-ext-enc-intra-refresh.mode", 1) } catch (_: Exception) {}
+            try { setInteger("vendor.qti-ext-enc-intra-refresh.period", 30) } catch (_: Exception) {}
+            try { setInteger(MediaFormat.KEY_INTRA_REFRESH_PERIOD, 30) } catch (_: Exception) {}
+
+            // 6. Initial QP override: start at crisp quality immediately
             try {
                 setInteger("vendor.qti-ext-enc-initial-qp.qp-i", 22)
                 setInteger("vendor.qti-ext-enc-initial-qp.qp-p", 24)
             } catch (_: Exception) {}
 
-            // 4-Slice Configuration: Divide frame into 4 horizontal slices (120px tall each for 480p)
-            val numSlices = 4
-            val sliceHeight = targetHeight / numSlices
-            try {
-                setInteger("slice-height", sliceHeight)
-            } catch (_: Exception) {}
-            try {
-                setInteger("vendor.qti-ext-enc-multi-slice.num-slices", numSlices)
-            } catch (_: Exception) {}
-            try {
-                setInteger("vendor.qti-ext-enc-slice-delivery-mode.enable", 1)
-            } catch (_: Exception) {}
             try {
                 setInteger("vendor.qti-ext-enc-caps-ltr.max-count", 0)
             } catch (_: Exception) {}
         }
 
-        val codec = createBestQualcommEncoder()
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         inputSurface = codec.createInputSurface()
         codec.start()
@@ -647,13 +672,12 @@ class StreamingService : Service() {
                         encodedBuffer.position(bufferInfo.offset)
                         encodedBuffer.limit(bufferInfo.offset + bufferInfo.size)
 
-                        val slices = extractSlicesFromBuffer(encodedBuffer)
-                        val totalSlices = slices.size
-                        for ((sliceIdx, sliceBytes) in slices.withIndex()) {
-                            val pkts = sendSliceChunkedUdp(sliceBytes, sequence, sliceIdx, totalSlices, now)
-                            packetsSentSinceReport += pkts
-                            bytesSentSinceReport += sliceBytes.size
-                        }
+                        val frameBytes = ByteArray(bufferInfo.size)
+                        encodedBuffer.get(frameBytes)
+
+                        val pkts = sendFrameChunkedUdp(frameBytes, sequence, now)
+                        packetsSentSinceReport += pkts
+                        bytesSentSinceReport += frameBytes.size
                         framesSentSinceReport += 1
                         sequence++
                         lastPacketSentTime = now
@@ -753,95 +777,18 @@ class StreamingService : Service() {
     }
 
     /**
-     * Splits a MediaCodec H.264 output buffer into individual Annex B slice NAL units.
-     * Prepends parameter sets (SPS=7, PPS=8, SEI=6) to Slice 0 so each keyframe slice is decodable.
+     * Chunk and transmit complete atomic frame Annex-B buffer over UDP with 18-byte zero-latency header.
+     * (sliceIdx=0, totalSlices=1 ensures immediate zero-buffer processing on receiver)
      */
-    private fun extractSlicesFromBuffer(buffer: ByteBuffer): List<ByteArray> {
-        val totalBytes = buffer.remaining()
-        if (totalBytes < 4) return emptyList()
-
-        val raw = ByteArray(totalBytes)
-        val originalPos = buffer.position()
-        buffer.get(raw)
-        buffer.position(originalPos)
-
-        val startOffsets = ArrayList<Int>()
-        var i = 0
-        while (i < totalBytes - 3) {
-            if (raw[i] == 0.toByte() && raw[i + 1] == 0.toByte()) {
-                if (raw[i + 2] == 1.toByte()) {
-                    startOffsets.add(i)
-                    i += 3
-                    continue
-                } else if (i < totalBytes - 4 && raw[i + 2] == 0.toByte() && raw[i + 3] == 1.toByte()) {
-                    startOffsets.add(i)
-                    i += 4
-                    continue
-                }
-            }
-            i++
-        }
-
-        if (startOffsets.isEmpty()) {
-            return listOf(raw)
-        }
-
-        val nalUnits = ArrayList<ByteArray>()
-        for (idx in 0 until startOffsets.size) {
-            val start = startOffsets[idx]
-            val end = if (idx + 1 < startOffsets.size) startOffsets[idx + 1] else totalBytes
-            nalUnits.add(raw.copyOfRange(start, end))
-        }
-
-        val slices = ArrayList<ByteArray>()
-        var headerAcc: ByteArray? = null
-
-        for (nal in nalUnits) {
-            var offset = 0
-            while (offset < nal.size && nal[offset] == 0.toByte()) {
-                offset++
-            }
-            if (offset < nal.size && nal[offset] == 1.toByte()) {
-                offset++
-            }
-            val nalType = if (offset < nal.size) (nal[offset].toInt() and 0x1F) else 0
-
-            if (nalType == 7 || nalType == 8 || nalType == 6) {
-                // SPS, PPS, or SEI - prepend to first video slice
-                headerAcc = if (headerAcc == null) nal else headerAcc + nal
-            } else if (nalType == 1 || nalType == 5) {
-                // Video slice
-                if (headerAcc != null) {
-                    slices.add(headerAcc + nal)
-                    headerAcc = null
-                } else {
-                    slices.add(nal)
-                }
-            } else {
-                slices.add(nal)
-            }
-        }
-
-        if (slices.isEmpty()) {
-            return listOf(raw)
-        }
-        return slices
-    }
-
-    /**
-     * Chunk and transmit progressive slice NAL unit over UDP with 18-byte slice-aware header
-     */
-    private fun sendSliceChunkedUdp(
-        sliceBytes: ByteArray,
+    private fun sendFrameChunkedUdp(
+        frameBytes: ByteArray,
         sequence: Long,
-        sliceIdx: Int,
-        totalSlices: Int,
         timestampMs: Long
     ): Int {
         val socket = udpSocket ?: return 0
         val target = udpTarget ?: return 0
 
-        val totalSize = sliceBytes.size
+        val totalSize = frameBytes.size
         val totalChunks = (totalSize + payloadMtu - 1) / payloadMtu
         val frameSeqInt = (sequence and 0xFFFFFFFFL).toInt()
 
@@ -851,21 +798,21 @@ class StreamingService : Service() {
         for (chunkIdx in 0 until totalChunks) {
             val chunkSize = minOf(payloadMtu, totalSize - offset)
 
-            // 18-byte Slice Header:
+            // 18-byte Header (sliceIdx=0, totalSlices=1 represents atomic frame):
             // 0..3: Frame Seq (uint32)
-            // 4: Slice Idx (uint8)
-            // 5: Total Slices (uint8)
+            // 4: Slice Idx (uint8) = 0
+            // 5: Total Slices (uint8) = 1
             // 6..7: Chunk Idx (uint16)
             // 8..9: Total Chunks (uint16)
             // 10..17: Timestamp ms (uint64)
             writeInt(videoPacketBuffer, 0, frameSeqInt)
-            videoPacketBuffer[4] = (sliceIdx and 0xFF).toByte()
-            videoPacketBuffer[5] = (totalSlices and 0xFF).toByte()
+            videoPacketBuffer[4] = 0.toByte()
+            videoPacketBuffer[5] = 1.toByte()
             writeShort(videoPacketBuffer, 6, chunkIdx.toShort())
             writeShort(videoPacketBuffer, 8, totalChunks.toShort())
             writeLong(videoPacketBuffer, 10, timestampMs)
 
-            System.arraycopy(sliceBytes, offset, videoPacketBuffer, headerSize, chunkSize)
+            System.arraycopy(frameBytes, offset, videoPacketBuffer, headerSize, chunkSize)
             offset += chunkSize
 
             val packet = DatagramPacket(videoPacketBuffer, headerSize + chunkSize, target.address, target.port)
@@ -876,7 +823,7 @@ class StreamingService : Service() {
 
             // Micro-pacing for multi-chunk bursts: paces packets evenly
             if (totalChunks > 1 && chunkIdx < totalChunks - 1) {
-                java.util.concurrent.locks.LockSupport.parkNanos(35_000L) // 35 microseconds inter-packet spacing
+                java.util.concurrent.locks.LockSupport.parkNanos(25_000L) // 25 microseconds inter-packet spacing
             }
         }
 

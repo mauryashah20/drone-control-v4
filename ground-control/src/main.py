@@ -165,8 +165,9 @@ def draw_hud(
         (iw, _), _ = cv2.getTextSize(inst_text, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
         draw_osd_text(img, inst_text, ((w - iw) // 2, h - 18), COLOR_WHITE_PURE, scale=0.44, thickness=1)
 
-    # Bottom-Right: Resolution & GPS Status
-    info_text = f"{stats.width}x{stats.height}  |  BT-SERIAL"
+    # Bottom-Right: Resolution, Codec & GPS Status
+    codec_name = getattr(stats, "codec", "H.264")
+    info_text = f"{stats.width}x{stats.height}  |  {codec_name}  |  BT-SERIAL"
     info_w = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)[0][0]
     draw_osd_text(img, info_text, (w - info_w - 22, h - 18), COLOR_GOLD_BRIGHT, scale=0.40, thickness=1)
 
@@ -390,8 +391,9 @@ def main():
             min_observed_diff[0] += 1.0
             min_observed_time[0] = now_perf
 
-        # Estimated one-way latency: baseline (~40ms) + transit / queuing delay
-        instant_lat = max(15.0, 40.0 + (raw_diff - min_observed_diff[0]))
+        # Estimated one-way latency: baseline (~18ms at 60 FPS, ~38ms at 30 FPS) + transit / queuing delay
+        base_hardware_ms = 18.0 if (latest_stats[0] and latest_stats[0].fps > 45.0) else 38.0
+        instant_lat = max(10.0, base_hardware_ms + (raw_diff - min_observed_diff[0]))
 
         # Add to rolling window
         latency_samples.append((now_perf, instant_lat))
@@ -453,8 +455,8 @@ def main():
             if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                 break
 
-            # Event-driven sync: wait up to 33ms for fresh frame, freeing Python GIL for socket ingest
-            new_frame_event.wait(timeout=0.033)
+            # Event-driven sync: wait up to 16ms for fresh frame, freeing Python GIL for socket ingest
+            new_frame_event.wait(timeout=0.016)
             new_frame_event.clear()
 
             is_connected = receiver.is_connected

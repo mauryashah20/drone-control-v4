@@ -290,7 +290,7 @@ class MainActivity : AppCompatActivity() {
             val fpsStr = if (rbFps60.isChecked) "60fps" else "30fps"
             val ip = etTargetIp.text.toString().trim().ifEmpty { DEFAULT_TARGET_IP }
             val port = etTargetPort.text.toString().trim().ifEmpty { "5005" }
-            tvStatusDetail.text = "Direct Qualcomm AVC pipe ready • Configured for $qualityStr @ $fpsStr to $ip:$port"
+            tvStatusDetail.text = "Direct Qualcomm HEVC pipe ready • Configured for $qualityStr @ $fpsStr to $ip:$port"
         }
     }
 
@@ -348,6 +348,7 @@ class MainActivity : AppCompatActivity() {
             putExtra(StreamingService.EXTRA_ENABLE_TELEMETRY, enableTelem)
             putExtra(StreamingService.EXTRA_ESP_IP, espIp)
             putExtra(StreamingService.EXTRA_TELEMETRY_PORT, telemPort)
+            putExtra(StreamingService.EXTRA_CODEC, "hevc")
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -371,7 +372,7 @@ class MainActivity : AppCompatActivity() {
         tvStatusBadge.setTextColor(ContextCompat.getColor(this, R.color.neon_green))
         viewStatusIndicator.setBackgroundResource(R.drawable.dot_neon_green)
         val modeDesc = if (isAuto) "Auto Quality" else "${width}x${height}"
-        tvStatusDetail.text = "Direct Qualcomm AVC pipe active • $modeDesc @ ${fps}fps to $ip:$port"
+        tvStatusDetail.text = "Direct Qualcomm HEVC pipe active • $modeDesc @ ${fps}fps to $ip:$port"
 
         // Give the app exclusive focus of all phone resources
         enterFocusMode()

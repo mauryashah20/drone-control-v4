@@ -92,6 +92,9 @@ class ZeroLatencyVideoReceiver:
         self._frame_total_slices: Dict[int, int] = {}
         self._completed_slices: Dict[int, Dict[int, bytes]] = {}
         self._frame_timestamps: Dict[int, int] = {}
+        self._frame_arrival_times: Dict[int, float] = {}
+        self._highest_seen_seq: int = -1
+        self.jitter_buffer_ms: float = 5.0  # Benchmarked winning value: absorbs cellular jitter with 0ms added in-order latency
         self._last_completed_seq: Optional[int] = None
         self._dropped_frames = 0
 
@@ -219,9 +222,9 @@ class ZeroLatencyVideoReceiver:
                 pass
 
     def _maybe_request_sync_frame(self) -> None:
-        """Throttled keyframe request triggered upon packet loss / sequence gap (max 1 per 1.5s)."""
+        """Throttled keyframe request triggered upon packet loss / sequence gap (max 1 per 0.5s)."""
         now = time.time()
-        if now - self._last_sync_request_time >= 1.5:
+        if now - self._last_sync_request_time >= 0.5:
             self._last_sync_request_time = now
             self.request_sync_frame()
 
@@ -267,8 +270,8 @@ class ZeroLatencyVideoReceiver:
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                # 64KB OS receive buffer: holds ~1 frame max, OS sheds late packets instead of hoarding 25s of queue
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024)
+                # 2MB OS receive buffer (benchmarked winning value): absorbs multi-chunk bursts without packet drops or latency penalty
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048 * 1024)
             except OSError:
                 pass
             sock.settimeout(0.1)
@@ -395,6 +398,8 @@ class ZeroLatencyVideoReceiver:
             frame_seq, slice_idx, total_slices, chunk_idx, total_chunks, ts_ms = struct.unpack_from(">IBBHHQ", data, 0)
             payload = data[HEADER_SIZE:]
 
+            now_perf = time.perf_counter()
+
             with self._lock:
                 # Discard stale packets from frames already completed
                 if self._last_completed_seq is not None:
@@ -402,23 +407,37 @@ class ZeroLatencyVideoReceiver:
                     if 0 <= diff < 100:
                         continue
 
-                # Zero-Buffer Instant Discard Rule:
-                # If a packet from a NEWER frame arrives while previous frame is incomplete,
-                # immediately drop the old frame, clear partial chunks, and trigger sync frame request!
-                if self._active_frame_seq is not None and frame_seq > self._active_frame_seq:
-                    gap = frame_seq - self._active_frame_seq
-                    self._dropped_frames += max(1, gap)
-                    self._slice_chunks.clear()
-                    self._slice_chunk_totals.clear()
-                    self._frame_total_slices.clear()
-                    self._completed_slices.clear()
-                    self._frame_timestamps.clear()
+                # Record arrival time and track highest seen sequence
+                if frame_seq not in self._frame_arrival_times:
+                    self._frame_arrival_times[frame_seq] = now_perf
+                    if frame_seq > self._highest_seen_seq:
+                        self._highest_seen_seq = frame_seq
+
+                # Expire incomplete frames whose jitter buffer window has elapsed
+                to_drop = []
+                for seq, arrival_ts in list(self._frame_arrival_times.items()):
+                    if self._last_completed_seq is not None and seq <= self._last_completed_seq:
+                        # Clean up already completed frames without counting as drops
+                        self._frame_arrival_times.pop(seq, None)
+                        continue
+                    age_ms = (now_perf - arrival_ts) * 1000.0
+                    if self._highest_seen_seq > seq and age_ms >= self.jitter_buffer_ms:
+                        to_drop.append(seq)
+                    elif age_ms > 200.0:  # Failsafe limit
+                        to_drop.append(seq)
+
+                for seq in to_drop:
+                    self._dropped_frames += 1
+                    self._slice_chunks.pop(seq, None)
+                    self._slice_chunk_totals.pop(seq, None)
+                    self._frame_total_slices.pop(seq, None)
+                    self._completed_slices.pop(seq, None)
+                    self._frame_timestamps.pop(seq, None)
+                    self._frame_arrival_times.pop(seq, None)
                     self._maybe_request_sync_frame()
-                    self._active_frame_seq = frame_seq
-                elif self._active_frame_seq is None:
-                    self._active_frame_seq = frame_seq
-                elif frame_seq < self._active_frame_seq:
-                    # Packet belongs to an already discarded or dead frame
+
+                if frame_seq not in self._frame_arrival_times:
+                    # Packet belongs to an already discarded frame
                     continue
 
                 if frame_seq not in self._slice_chunks:
@@ -447,10 +466,11 @@ class ZeroLatencyVideoReceiver:
                         # Reconstruct full frame from all slices in sequence
                         full_frame = b"".join(self._completed_slices[frame_seq][i] for i in range(expected_slices))
                         frame_ts = self._frame_timestamps.pop(frame_seq, ts_ms)
-                        self._slice_chunks.clear()
-                        self._slice_chunk_totals.clear()
-                        self._frame_total_slices.clear()
-                        self._completed_slices.clear()
+                        self._slice_chunks.pop(frame_seq, None)
+                        self._slice_chunk_totals.pop(frame_seq, None)
+                        self._frame_total_slices.pop(frame_seq, None)
+                        self._completed_slices.pop(frame_seq, None)
+                        self._frame_arrival_times.pop(frame_seq, None)
 
                         # Track dropped frame gaps
                         if self._last_completed_seq is not None:

@@ -339,8 +339,8 @@ class StreamingService : Service() {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, targetBitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, targetFps)
-            // 4G/5G Periodic Intra-Refresh: Disable periodic 1-second IDR bursts (prevents carrier modem queue spikes)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 60)
+            // 1-second Keyframe interval: Ensures rapid reference frame self-healing without bitrate explosion
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
 
             // Pure FPV: CBR (Constant Bitrate) mode prevents sudden burst spikes that cause cellular bufferbloat!
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
@@ -390,10 +390,8 @@ class StreamingService : Service() {
             // 4. Qualcomm hardware low-latency extensions
             try { setInteger("vendor.qti-ext-enc-low-latency.enable", 1) } catch (_: Exception) {}
 
-            // 5. Qualcomm Intra-refresh: smooth macroblock refreshes every 15 frames (0.25s) with 0ms burst spikes
-            try { setInteger("vendor.qti-ext-enc-intra-refresh.mode", 1) } catch (_: Exception) {}
-            try { setInteger("vendor.qti-ext-enc-intra-refresh.period", 15) } catch (_: Exception) {}
-            try { setInteger(MediaFormat.KEY_INTRA_REFRESH_PERIOD, 15) } catch (_: Exception) {}
+            // 5. Standard IDR keyframe mode: ensures full clean frames without gray/black intra-refresh mosaic artifacts
+            try { setInteger("vendor.qti-ext-enc-intra-refresh.mode", 0) } catch (_: Exception) {}
 
             // 6. Initial QP override: start at crisp quality immediately
             try {

@@ -219,18 +219,20 @@ class ZeroLatencyVideoReceiver:
                 pass
 
     def _maybe_request_sync_frame(self) -> None:
-        """Throttled keyframe request triggered instantly upon packet loss / sequence gap."""
+        """Throttled keyframe request triggered upon packet loss / sequence gap (max 1 per 1.5s)."""
         now = time.time()
-        if now - self._last_sync_request_time >= 0.25:
+        if now - self._last_sync_request_time >= 1.5:
             self._last_sync_request_time = now
             self.request_sync_frame()
 
     def send_feedback(self, latency_ms: float) -> None:
-        """Sends latency feedback back to transmitter for dynamic quality scaling."""
+        """Sends latency feedback back to transmitter for dynamic 4G/5G rate adaptation."""
         if self._sock and self._last_sender_addr and self.is_connected:
             try:
                 lat_int = int(max(0, min(65535, latency_ms)))
-                self._sock.sendto(struct.pack(">H", lat_int), self._last_sender_addr)
+                # Micro-feedback packet: 0xFF 0xFB + 2B latency_ms
+                pkt = b"\xFF\xFB" + struct.pack(">H", lat_int)
+                self._sock.sendto(pkt, self._last_sender_addr)
             except Exception:
                 pass
 
@@ -392,12 +394,6 @@ class ZeroLatencyVideoReceiver:
             # 10..17: Timestamp in ms (uint64)
             frame_seq, slice_idx, total_slices, chunk_idx, total_chunks, ts_ms = struct.unpack_from(">IBBHHQ", data, 0)
             payload = data[HEADER_SIZE:]
-
-            # Analog FPV Stale Packet Shredder:
-            # Discard immediately if packet transit delay is older than 100ms
-            now_ms = int(now * 1000)
-            if ts_ms > 0 and (now_ms - ts_ms > 100):
-                continue
 
             with self._lock:
                 # Discard stale packets from frames already completed

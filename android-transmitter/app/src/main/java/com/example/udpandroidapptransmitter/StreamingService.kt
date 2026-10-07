@@ -97,15 +97,15 @@ class StreamingService : Service() {
     private var udpSocket: DatagramSocket? = null
     private var udpTarget: InetSocketAddress? = null
 
-    // Stream Configuration
+    // Stream Configuration (Tuned for 4G/5G Cellular HEVC)
     private var targetWidth = 640
     private var targetHeight = 480
     private var targetFps = 60
-    private var targetBitrate = 1_500_000
+    private var targetBitrate = 900_000
     private var targetCodec = "hevc"
     private var isAutoQuality = true
     private var isAutoContrast = true
-    private var currentBitrate = 1_500_000
+    private var currentBitrate = 900_000
     private var targetIp = "2401:4900:8f73:7949:8fa7:f1ad:81c1:b5b2"
     private var targetPort = 5005
 
@@ -339,8 +339,8 @@ class StreamingService : Service() {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, targetBitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, targetFps)
-            // 1-second keyframe interval: fast recovery from packet loss
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            // 4G/5G Periodic Intra-Refresh: Disable periodic 1-second IDR bursts (prevents carrier modem queue spikes)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 60)
 
             // Pure FPV: CBR (Constant Bitrate) mode prevents sudden burst spikes that cause cellular bufferbloat!
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
@@ -390,10 +390,10 @@ class StreamingService : Service() {
             // 4. Qualcomm hardware low-latency extensions
             try { setInteger("vendor.qti-ext-enc-low-latency.enable", 1) } catch (_: Exception) {}
 
-            // 5. Qualcomm Intra-refresh: smooth macroblock refreshes with 0ms burst spikes
+            // 5. Qualcomm Intra-refresh: smooth macroblock refreshes every 15 frames (0.25s) with 0ms burst spikes
             try { setInteger("vendor.qti-ext-enc-intra-refresh.mode", 1) } catch (_: Exception) {}
-            try { setInteger("vendor.qti-ext-enc-intra-refresh.period", 30) } catch (_: Exception) {}
-            try { setInteger(MediaFormat.KEY_INTRA_REFRESH_PERIOD, 30) } catch (_: Exception) {}
+            try { setInteger("vendor.qti-ext-enc-intra-refresh.period", 15) } catch (_: Exception) {}
+            try { setInteger(MediaFormat.KEY_INTRA_REFRESH_PERIOD, 15) } catch (_: Exception) {}
 
             // 6. Initial QP override: start at crisp quality immediately
             try {
@@ -744,6 +744,12 @@ class StreamingService : Service() {
                         if (buf[0] == 0xFF.toByte() && buf[1] == 0x02.toByte()) {
                             Log.i(TAG, "Sync IDR frame requested by laptop receiver")
                             requestSyncFrame()
+                        } else if (buf[0] == 0xFF.toByte() && buf[1] == 0xFB.toByte()) {
+                            // 0xFF 0xFB: Real-time latency micro-feedback from laptop receiver
+                            if (packet.length >= 4) {
+                                val latMs = ((buf[2].toInt() and 0xFF) shl 8) or (buf[3].toInt() and 0xFF)
+                                handleLatencyFeedback(latMs)
+                            }
                         } else if (buf[0] == 0xFF.toByte() && buf[1] == 0x55.toByte()) {
                             // 0xFF 0x55: Automatic Peer IP Update Push packet from Vercel
                             try {
@@ -763,6 +769,52 @@ class StreamingService : Service() {
                 } catch (_: Exception) {
                     break
                 }
+            }
+        }
+    }
+
+    @Volatile private var lastRateAdjustmentTime = 0L
+
+    fun updateBitrateOnTheFly(newBitrate: Int) {
+        val clamped = newBitrate.coerceIn(350_000, 1_400_000)
+        if (clamped == currentBitrate) return
+        currentBitrate = clamped
+        try {
+            val params = android.os.Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, clamped)
+            }
+            encoder?.setParameters(params)
+            Log.i(TAG, "[RATE-CONTROL] Scaled encoder bitrate to ${clamped / 1000} kbps")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to adjust bitrate: ${e.message}")
+        }
+    }
+
+    private fun handleLatencyFeedback(latencyMs: Int) {
+        if (!isAutoQuality) return
+        val now = System.currentTimeMillis()
+        if (now - lastRateAdjustmentTime < 120) return
+
+        if (latencyMs > 80) {
+            // Bufferbloat detected! Instantly drop bitrate by 25% down to 400kbps floor
+            val newBitrate = (currentBitrate * 0.75f).toInt().coerceAtLeast(400_000)
+            if (newBitrate < currentBitrate) {
+                lastRateAdjustmentTime = now
+                updateBitrateOnTheFly(newBitrate)
+            }
+        } else if (latencyMs > 55) {
+            // Mild cellular queue buildup: gentle step down by 10%
+            val newBitrate = (currentBitrate * 0.90f).toInt().coerceAtLeast(450_000)
+            if (newBitrate < currentBitrate) {
+                lastRateAdjustmentTime = now
+                updateBitrateOnTheFly(newBitrate)
+            }
+        } else if (latencyMs < 40 && (now - lastRateAdjustmentTime >= 500)) {
+            // Channel is clear and clean: smoothly probe bandwidth upward (+50 kbps)
+            val newBitrate = (currentBitrate + 50_000).coerceAtMost(targetBitrate)
+            if (newBitrate > currentBitrate) {
+                lastRateAdjustmentTime = now
+                updateBitrateOnTheFly(newBitrate)
             }
         }
     }
@@ -795,6 +847,12 @@ class StreamingService : Service() {
         var packetsCount = 0
         var offset = 0
 
+        // 4G/5G subframe pacing calculation: smooth out packet arrivals over frame window
+        val frameDurationUs = 1_000_000L / targetFps.coerceAtLeast(1)
+        val paceIntervalNs = if (totalChunks > 1) {
+            ((frameDurationUs * 500L) / totalChunks).coerceIn(80_000L, 1_000_000L)
+        } else 0L
+
         for (chunkIdx in 0 until totalChunks) {
             val chunkSize = minOf(payloadMtu, totalSize - offset)
 
@@ -821,9 +879,9 @@ class StreamingService : Service() {
                 packetsCount++
             } catch (_: Exception) {}
 
-            // Micro-pacing for multi-chunk bursts: paces packets evenly
-            if (totalChunks > 1 && chunkIdx < totalChunks - 1) {
-                java.util.concurrent.locks.LockSupport.parkNanos(25_000L) // 25 microseconds inter-packet spacing
+            // 4G/5G subframe pacing: avoids dumping all chunks into modem buffer in single microsecond
+            if (totalChunks > 1 && chunkIdx < totalChunks - 1 && paceIntervalNs > 0) {
+                java.util.concurrent.locks.LockSupport.parkNanos(paceIntervalNs)
             }
         }
 

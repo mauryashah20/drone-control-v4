@@ -467,7 +467,7 @@ def main():
                 now_perf = time.time()
                 avg_latency_2s[0] = get_2s_avg_latency()
 
-                if now_perf - last_feedback_time[0] >= 0.2:
+                if now_perf - last_feedback_time[0] >= 0.1:
                     last_feedback_time[0] = now_perf
                     receiver.send_feedback(avg_latency_2s[0])
 

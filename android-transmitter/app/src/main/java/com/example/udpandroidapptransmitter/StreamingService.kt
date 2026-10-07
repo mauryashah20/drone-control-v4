@@ -368,10 +368,12 @@ class StreamingService : Service() {
                 try { setInteger(MediaFormat.KEY_OPERATING_RATE, 240) } catch (_: Exception) {}
             }
 
-            // 2. Bound QP minimum for crisp baseline, but allow full upper range (up to 51) so frame sizes never explode during motion
+            // 2. Bound QP range for crisp razor-sharp baseline and solid motion stability
             try {
-                setInteger("vendor.qti-ext-enc-qp-range.qp-i-min", 16)
-                setInteger("vendor.qti-ext-enc-qp-range.qp-p-min", 18)
+                setInteger("vendor.qti-ext-enc-qp-range.qp-i-min", 14)
+                setInteger("vendor.qti-ext-enc-qp-range.qp-p-min", 16)
+                setInteger("vendor.qti-ext-enc-qp-range.qp-i-max", 38)
+                setInteger("vendor.qti-ext-enc-qp-range.qp-p-max", 42)
             } catch (_: Exception) {}
 
             // 3. Android Low-latency & zero-lookahead flags
@@ -395,8 +397,8 @@ class StreamingService : Service() {
 
             // 6. Initial QP override: start at crisp quality immediately
             try {
-                setInteger("vendor.qti-ext-enc-initial-qp.qp-i", 22)
-                setInteger("vendor.qti-ext-enc-initial-qp.qp-p", 24)
+                setInteger("vendor.qti-ext-enc-initial-qp.qp-i", 18)
+                setInteger("vendor.qti-ext-enc-initial-qp.qp-p", 20)
             } catch (_: Exception) {}
 
             try {
@@ -774,7 +776,7 @@ class StreamingService : Service() {
     @Volatile private var lastRateAdjustmentTime = 0L
 
     fun updateBitrateOnTheFly(newBitrate: Int) {
-        val clamped = newBitrate.coerceIn(350_000, 1_400_000)
+        val clamped = newBitrate.coerceIn(800_000, 3_000_000)
         if (clamped == currentBitrate) return
         currentBitrate = clamped
         try {
@@ -791,25 +793,25 @@ class StreamingService : Service() {
     private fun handleLatencyFeedback(latencyMs: Int) {
         if (!isAutoQuality) return
         val now = System.currentTimeMillis()
-        if (now - lastRateAdjustmentTime < 120) return
+        if (now - lastRateAdjustmentTime < 150) return
 
-        if (latencyMs > 80) {
-            // Bufferbloat detected! Instantly drop bitrate by 25% down to 400kbps floor
-            val newBitrate = (currentBitrate * 0.75f).toInt().coerceAtLeast(400_000)
+        if (latencyMs > 120) {
+            // Bufferbloat detected! Step down toward 800 kbps floor
+            val newBitrate = (currentBitrate * 0.80f).toInt().coerceAtLeast(800_000)
             if (newBitrate < currentBitrate) {
                 lastRateAdjustmentTime = now
                 updateBitrateOnTheFly(newBitrate)
             }
-        } else if (latencyMs > 55) {
+        } else if (latencyMs > 85) {
             // Mild cellular queue buildup: gentle step down by 10%
-            val newBitrate = (currentBitrate * 0.90f).toInt().coerceAtLeast(450_000)
+            val newBitrate = (currentBitrate * 0.90f).toInt().coerceAtLeast(950_000)
             if (newBitrate < currentBitrate) {
                 lastRateAdjustmentTime = now
                 updateBitrateOnTheFly(newBitrate)
             }
-        } else if (latencyMs < 40 && (now - lastRateAdjustmentTime >= 500)) {
-            // Channel is clear and clean: smoothly probe bandwidth upward (+50 kbps)
-            val newBitrate = (currentBitrate + 50_000).coerceAtMost(targetBitrate)
+        } else if (latencyMs < 60 && (now - lastRateAdjustmentTime >= 400)) {
+            // Channel is clear and clean: smoothly probe bandwidth upward (+100 kbps)
+            val newBitrate = (currentBitrate + 100_000).coerceAtMost(targetBitrate)
             if (newBitrate > currentBitrate) {
                 lastRateAdjustmentTime = now
                 updateBitrateOnTheFly(newBitrate)

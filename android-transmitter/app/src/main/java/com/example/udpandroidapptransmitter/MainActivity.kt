@@ -321,16 +321,16 @@ class MainActivity : AppCompatActivity() {
 
         val (width, height, bitrate) = when {
             isAuto -> {
-                // Auto mode: high-detail 480p tuned for 4G/5G (1.0 Mbps @ 60fps, 800 kbps @ 30fps)
-                val br = if (fps == 60) 1_000_000 else 800_000
+                // Auto mode: high-detail 480p tuned for crisp 4G/5G (1.8 Mbps @ 60fps, 1.4 Mbps @ 30fps)
+                val br = if (fps == 60) 1_800_000 else 1_400_000
                 Triple(640, 480, br)
             }
             rb360p.isChecked -> {
-                val br = if (fps == 60) 650_000 else 450_000
+                val br = if (fps == 60) 1_100_000 else 800_000
                 Triple(640, 360, br)
             }
             else -> {
-                val br = if (fps == 60) 1_200_000 else 900_000
+                val br = if (fps == 60) 2_400_000 else 1_800_000
                 Triple(640, 480, br)
             }
         }

@@ -97,6 +97,7 @@ class ZeroLatencyVideoReceiver:
         self.jitter_buffer_ms: float = 5.0  # Benchmarked winning value: absorbs cellular jitter with 0ms added in-order latency
         self._last_completed_seq: Optional[int] = None
         self._dropped_frames = 0
+        self._min_clock_skew: Optional[float] = None
 
         # Stats tracking
         self._total_frames = 0
@@ -508,7 +509,14 @@ class ZeroLatencyVideoReceiver:
 
         annexb_bytes = self._to_annexb(raw_bytes)
         now_ms = int(time.time() * 1000)
-        transit_latency = float(now_ms - sender_ts_ms)
+        raw_diff = float(now_ms - sender_ts_ms)
+        if self._min_clock_skew is None or raw_diff < self._min_clock_skew:
+            self._min_clock_skew = raw_diff
+        elif raw_diff - self._min_clock_skew > 3000:
+            self._min_clock_skew = raw_diff
+
+        # Clean clock-skew compensated transit latency (jitter offset + 25ms baseline network RTT)
+        transit_latency = max(10.0, min(500.0, (raw_diff - self._min_clock_skew) + 25.0))
 
         # Dynamic Codec Detection & Switching (H.264 <-> H.265/HEVC)
         detected = self._detect_codec(annexb_bytes)

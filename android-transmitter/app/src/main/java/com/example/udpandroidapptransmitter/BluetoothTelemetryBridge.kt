@@ -47,6 +47,18 @@ class BluetoothTelemetryBridge(
 
     @Volatile var isConnected = false
 
+    @Volatile private var targetAddr: InetAddress? = try { InetAddress.getByName(laptopIp) } catch (e: Exception) { null }
+
+    fun updateTargetIp(newIp: String) {
+        laptopIp = newIp
+        try {
+            targetAddr = InetAddress.getByName(newIp)
+            Log.i(TAG, "BluetoothTelemetryBridge updated target IP to $newIp")
+        } catch (e: Exception) {
+            Log.e(TAG, "Bad new laptop IP $newIp: ${e.message}")
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     fun start() {
         if (isRunning.getAndSet(true)) return
@@ -69,56 +81,51 @@ class BluetoothTelemetryBridge(
         // BT → UDP uplink thread (handles connect + reconnect internally)
         btToUdpThread = Thread({
             try {
-                val targetAddr = try { InetAddress.getByName(laptopIp) } catch (e: Exception) {
-                    Log.e(TAG, "Bad laptop IP $laptopIp"); isRunning.set(false); return@Thread
-                }
-
-
-
                 while (isRunning.get() && !Thread.currentThread().isInterrupted) {
-                    val socket = connectBluetooth()
-                    if (socket == null) {
+                val socket = connectBluetooth()
+                if (socket == null) {
+                    try {
+                        Thread.sleep(RECONNECT_DELAY_MS)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                    continue
+                }
+                btSocket = socket
+                isConnected = true
+                Log.i(TAG, "BT connected to $btDeviceName — bridge live")
+
+                try {
+                    val input = socket.inputStream
+                    val buf = ByteArray(BUFFER_SIZE)
+                    while (isRunning.get() && !Thread.currentThread().isInterrupted) {
+                        val n = input.read(buf)
+                        if (n <= 0) break
+                        val addr = targetAddr ?: continue
+                        // Forward raw MAVLink bytes to laptop via UDP
+                        val udp = udpSocket ?: break
+                        val pkt = DatagramPacket(buf, 0, n, addr, laptopPort)
+                        udp.send(pkt)
+                        uplinkPackets.incrementAndGet()
+                        uplinkBytes.addAndGet(n.toLong())
+                    }
+                } catch (e: Exception) {
+                    if (isRunning.get()) Log.w(TAG, "BT read error: ${e.message}")
+                } finally {
+                    isConnected = false
+                    try { socket.close() } catch (_: Exception) {}
+                    btSocket = null
+                    if (isRunning.get() && !Thread.currentThread().isInterrupted) {
+                        Log.i(TAG, "BT disconnected — reconnecting in ${RECONNECT_DELAY_MS}ms")
                         try {
                             Thread.sleep(RECONNECT_DELAY_MS)
                         } catch (_: InterruptedException) {
                             break
                         }
-                        continue
-                    }
-                    btSocket = socket
-                    isConnected = true
-                    Log.i(TAG, "BT connected to $btDeviceName — bridge live")
-
-                    try {
-                        val input = socket.inputStream
-                        val buf = ByteArray(BUFFER_SIZE)
-                        while (isRunning.get() && !Thread.currentThread().isInterrupted) {
-                            val n = input.read(buf)
-                            if (n <= 0) break
-                            // Forward raw MAVLink bytes to laptop via UDP
-                            val udp = udpSocket ?: break
-                            val pkt = DatagramPacket(buf, 0, n, targetAddr, laptopPort)
-                            udp.send(pkt)
-                            uplinkPackets.incrementAndGet()
-                            uplinkBytes.addAndGet(n.toLong())
-                        }
-                    } catch (e: Exception) {
-                        if (isRunning.get()) Log.w(TAG, "BT read error: ${e.message}")
-                    } finally {
-                        isConnected = false
-                        try { socket.close() } catch (_: Exception) {}
-                        btSocket = null
-                        if (isRunning.get() && !Thread.currentThread().isInterrupted) {
-                            Log.i(TAG, "BT disconnected — reconnecting in ${RECONNECT_DELAY_MS}ms")
-                            try {
-                                Thread.sleep(RECONNECT_DELAY_MS)
-                            } catch (_: InterruptedException) {
-                                break
-                            }
-                        }
                     }
                 }
-            } catch (_: InterruptedException) {
+            }
+        } catch (_: InterruptedException) {
                 // Thread interrupted cleanly on stop
             } catch (t: Throwable) {
                 Log.e(TAG, "BT-Uplink thread error: ${t.message}", t)

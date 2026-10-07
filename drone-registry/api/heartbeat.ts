@@ -1,12 +1,20 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { validateDeviceId, validateIPv6, validatePort } from "../lib/validate";
+import { validateDeviceId, validateIPv6, parsePort } from "../lib/validate";
 import { verifyToken, extractBearerToken } from "../lib/auth";
 import { isGlobalUnicastIPv6 } from "../lib/ip";
 import { getDevice, updateHeartbeat } from "../lib/db";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-device-token, x-registration-secret, x-admin-key");
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
   if (req.method !== "POST") {
-    res.setHeader("Allow", ["POST"]);
+    res.setHeader("Allow", ["POST", "OPTIONS"]);
     return res.status(405).json({ success: false, error: `Method ${req.method} Not Allowed` });
   }
 
@@ -61,13 +69,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     if (port !== undefined) {
-      if (!validatePort(port)) {
+      const parsed = parsePort(port);
+      if (parsed === null) {
         return res.status(400).json({
           success: false,
           error: "Invalid port number provided in heartbeat",
         });
       }
-      updatedPort = port;
+      updatedPort = parsed;
     }
 
     const updated = await updateHeartbeat(deviceId, updatedIpv6, updatedPort);

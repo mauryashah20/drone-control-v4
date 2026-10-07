@@ -27,12 +27,18 @@ object DroneRegistryManager {
     private val executor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    const val DEFAULT_REGISTRY_URL = "https://drone-registry.vercel.app"
+    const val DEFAULT_REGISTRY_URL = "https://drone-registry-one.vercel.app"
     const val DEFAULT_DRONE_ID = "DRONE-001"
     const val DEFAULT_DEVICE_TOKEN = "acfd09978673d60a0be1121ee701805cdc275f14a1849e44"
 
     @Volatile var lastRegisteredIp: String? = null
         private set
+    @Volatile var tempLocalIp: String? = null
+        private set
+    @Volatile var lastDiscoveredTargetIp: String? = null
+    @Volatile var lastDiscoveredTargetPort: Int = 5005
+    var onTargetDiscovered: ((String, Int) -> Unit)? = null
+
     @Volatile var isAutoSyncRunning = false
         private set
 
@@ -139,6 +145,22 @@ object DroneRegistryManager {
                 val success = json.optBoolean("success", false)
                 val msg = if (success) {
                     lastRegisteredIp = detectedIp
+                    tempLocalIp = detectedIp
+
+                    // Check if counterpart peer device (Ground Station) is returned
+                    val peerObj = json.optJSONObject("peerTarget")
+                    if (peerObj != null) {
+                        val peerIp = peerObj.optString("ipv6")
+                        val peerPort = peerObj.optInt("port", 5005)
+                        if (peerIp.isNotEmpty()) {
+                            lastDiscoveredTargetIp = peerIp
+                            lastDiscoveredTargetPort = peerPort
+                            Log.i(TAG, "Vercel register response included peer target: [$peerIp]:$peerPort")
+                            StreamingService.activeInstance?.updateTargetAddress(peerIp, peerPort)
+                            mainHandler.post { onTargetDiscovered?.invoke(peerIp, peerPort) }
+                        }
+                    }
+
                     "Registered $deviceId at [$detectedIp]:$port"
                 } else {
                     json.optString("error", "HTTP $code")
@@ -240,16 +262,46 @@ object DroneRegistryManager {
         }
     }
 
+    @Volatile var lastTargetResponseTimeMs: Long = 0L
+    @Volatile var lastLookupTimeMs: Long = 0L
+
+    fun markTargetResponded() {
+        lastTargetResponseTimeMs = System.currentTimeMillis()
+    }
+
+    /**
+     * Rule 2: If the targeted IP is not responding for more than 10 seconds, only then look up.
+     * Enforces a 10s cooldown to prevent Vercel request quota exhaustion.
+     */
+    fun lookupTargetIfUnresponsive(
+        targetDeviceId: String = "GROUND-001",
+        unresponsiveThresholdMs: Long = 10_000L,
+        onResult: (success: Boolean, ipv6: String?, port: Int?, isOnline: Boolean, message: String) -> Unit
+    ) {
+        val now = System.currentTimeMillis()
+        if (lastTargetResponseTimeMs > 0 && (now - lastTargetResponseTimeMs < unresponsiveThresholdMs)) {
+            // Target is currently responding, do NOT query Vercel!
+            return
+        }
+
+        if (now - lastLookupTimeMs < unresponsiveThresholdMs) {
+            // In cooldown, avoid spamming Vercel
+            return
+        }
+
+        lastLookupTimeMs = now
+        Log.i(TAG, "Target $targetDeviceId unresponsive (> ${unresponsiveThresholdMs / 1000}s) — querying Vercel discovery...")
+        lookupTarget(deviceId = targetDeviceId, onResult = onResult)
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
-    // ZERO-TOUCH AUTOMATIC IPV6 DISCOVERY & ROAMING DAEMON (DECOUPLED FROM VIDEO)
+    // ZERO-TOUCH IPV6 DISCOVERY & ROAMING DAEMON
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Starts fully automatic IPv6 discovery, registration, and roaming monitoring.
-     * Operates 100% autonomously without human interaction:
-     *  1. Immediately detects cellular IPv6 and registers with Vercel.
-     *  2. Listens for network changes (tower handover, reconnect, carrier IP change) and re-registers instantly.
-     *  3. Runs a background timer every 30s completely off the video thread to verify IP and keep heartbeat fresh.
+     * Starts automatic IPv6 discovery, registration, and roaming monitoring.
+     * Rule 1: Registers once on initialization. Re-registers ONLY when phone's own cellular IPv6 changes.
+     * ZERO recurring heartbeats — preserves Vercel free quota.
      */
     fun startAutoSync(
         context: Context,
@@ -259,10 +311,37 @@ object DroneRegistryManager {
         if (isAutoSyncRunning) return
         isAutoSyncRunning = true
 
-        // 1. Initial immediate check & registration
+        // 1. Initial immediate check & registration on app initialization
         checkAndUpdateIpv6(port, onStatusUpdate)
 
-        // 2. Register Android NetworkCallback for real-time carrier IP change detection
+        // 2. Start internal check loop every 750ms (pure internal inspection, 0 network requests when unchanged)
+        try {
+            val sched = Executors.newSingleThreadScheduledExecutor()
+            scheduledExecutor = sched
+            sched.scheduleWithFixedDelay({
+                try {
+                    val currentIp = detectCellularIPv6()
+                    if (currentIp != null && currentIp != tempLocalIp) {
+                        Log.i(TAG, "Internal IP check (every 750ms): Detected change [$tempLocalIp] -> [$currentIp]. Replacing temp IP and updating Vercel...")
+                        tempLocalIp = currentIp
+                        registerDrone(port = port) { success, msg, ip ->
+                            if (success && ip != null) {
+                                lastRegisteredIp = ip
+                                mainHandler.post { onStatusUpdate?.invoke("Drone registered on Vercel: [$ip]:$port", true) }
+                            } else {
+                                mainHandler.post { onStatusUpdate?.invoke("Auto-sync error: $msg", false) }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Internal IP check loop error: ${e.message}")
+                }
+            }, 750, 750, TimeUnit.MILLISECONDS)
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not start scheduled IP check loop: ${e.message}")
+        }
+
+        // 3. Register Android NetworkCallback for OS carrier network change events
         try {
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
             if (cm != null) {
@@ -272,12 +351,10 @@ object DroneRegistryManager {
 
                 val cb = object : ConnectivityManager.NetworkCallback() {
                     override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
-                        Log.i(TAG, "Network link properties changed — auto-verifying IPv6...")
                         checkAndUpdateIpv6(port, onStatusUpdate)
                     }
 
                     override fun onAvailable(network: Network) {
-                        Log.i(TAG, "Network available — auto-syncing IPv6...")
                         checkAndUpdateIpv6(port, onStatusUpdate)
                     }
                 }
@@ -288,23 +365,12 @@ object DroneRegistryManager {
             Log.w(TAG, "Could not register NetworkCallback: ${e.message}")
         }
 
-        // 3. Decoupled 30-second background maintenance cycle
-        val scheduler = Executors.newSingleThreadScheduledExecutor()
-        scheduledExecutor = scheduler
-        scheduler.scheduleWithFixedDelay({
-            try {
-                checkAndUpdateIpv6(port, onStatusUpdate)
-            } catch (t: Throwable) {
-                Log.w(TAG, "Periodic auto-sync cycle error: ${t.message}")
-            }
-        }, 30, 30, TimeUnit.SECONDS)
-
-        Log.i(TAG, "Zero-touch AutoSync daemon active (instant listener + 30s background cycle)")
+        Log.i(TAG, "Zero-touch AutoSync active (750ms internal check + cellular change monitor)")
     }
 
     /**
      * Checks if device IPv6 has changed; if changed, registers new IP with Vercel.
-     * If unchanged, sends heartbeat to maintain online status.
+     * If unchanged, makes ZERO network requests to preserve Vercel quota.
      */
     fun checkAndUpdateIpv6(
         port: Int = 5005,
@@ -317,8 +383,9 @@ object DroneRegistryManager {
                 return@execute
             }
 
-            if (currentIp != lastRegisteredIp) {
-                Log.i(TAG, "AutoSync: New carrier IPv6 detected [$currentIp] (was [$lastRegisteredIp]) -> registering...")
+            if (currentIp != tempLocalIp) {
+                Log.i(TAG, "AutoSync: New carrier IPv6 detected [$currentIp] (was [$tempLocalIp]) -> registering...")
+                tempLocalIp = currentIp
                 registerDrone(port = port) { success, msg, ip ->
                     if (success && ip != null) {
                         lastRegisteredIp = ip
@@ -328,8 +395,7 @@ object DroneRegistryManager {
                     }
                 }
             } else {
-                // IP is current — send lightweight heartbeat to keep dashboard online
-                sendHeartbeat()
+                // IP is current — do NOT send heartbeat, avoid burning Vercel request quota
                 mainHandler.post { onStatusUpdate?.invoke("Drone registered on Vercel: [$currentIp]:$port", true) }
             }
         }

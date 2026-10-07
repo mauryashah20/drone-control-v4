@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import threading
 import collections
 from typing import Optional
 import cv2
@@ -343,9 +344,16 @@ def main():
     )
     telem_router.start()
 
+    def on_peer_update_callback(peer_ip: str, peer_port: int):
+        print(f"[REGISTRY] Live peer updated -> [{peer_ip}]:{peer_port}", flush=True)
+
     # Zero-touch Vercel Discovery Registry Daemon:
-    # Registers GROUND-001 with current dynamic IPv6 and maintains 20s keep-alive heartbeat
-    registry_client = GroundStationRegistryClient(port=5005)
+    # Registers GROUND-001 with dynamic IPv6, checks local interface every 750ms internally,
+    # and automatically receives peer updates from Vercel.
+    registry_client = GroundStationRegistryClient(
+        port=5005,
+        on_peer_update=on_peer_update_callback,
+    )
     registry_client.start_background_daemon()
 
     latest_frame = [None]
@@ -360,6 +368,7 @@ def main():
     min_observed_time = [0.0]
     avg_latency_2s = [0.0]
     last_feedback_time = [0.0]
+    new_frame_event = threading.Event()
 
     def record_latency(sender_ts_ms: int):
         if sender_ts_ms <= 0:
@@ -369,9 +378,16 @@ def main():
         raw_diff = float(now_ms - sender_ts_ms)
 
         # Baseline calibration (tracks minimum physical transit + clock offset)
-        # Periodically refresh minimum every 60s so it smoothly adapts to slow clock drift
-        if min_observed_diff[0] is None or raw_diff < min_observed_diff[0] or (now_perf - min_observed_time[0] > 60.0):
+        # Smoothly adapts to slow clock drift without harsh 60s spike resets
+        if min_observed_diff[0] is None:
             min_observed_diff[0] = raw_diff
+            min_observed_time[0] = now_perf
+        elif raw_diff < min_observed_diff[0]:
+            min_observed_diff[0] = raw_diff
+            min_observed_time[0] = now_perf
+        elif now_perf - min_observed_time[0] > 10.0:
+            # Gentle drift tracking: relax baseline minimum upward by 1ms every 10s
+            min_observed_diff[0] += 1.0
             min_observed_time[0] = now_perf
 
         # Estimated one-way latency: baseline (~40ms) + transit / queuing delay
@@ -399,6 +415,7 @@ def main():
         latest_stats[0] = stats
         if stats.sender_timestamp_ms > 0:
             record_latency(stats.sender_timestamp_ms)
+        new_frame_event.set()
 
     def on_connection_callback(connected: bool, reason: str, sender_str: Optional[str]):
         if not connected:
@@ -413,6 +430,7 @@ def main():
             min_observed_diff[0] = None
             latency_samples.clear()
             avg_latency_2s[0] = 0.0
+        new_frame_event.set()
 
     receiver = ZeroLatencyVideoReceiver(
         bind_ip="0.0.0.0",
@@ -420,6 +438,7 @@ def main():
         on_frame=on_frame_callback,
         on_connection_change=on_connection_callback,
         on_log=lambda msg: print(msg, flush=True),
+        on_peer_update=on_peer_update_callback,
     )
     receiver.start()
 
@@ -433,6 +452,10 @@ def main():
             # Check if user clicked window close 'X' button
             if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                 break
+
+            # Event-driven sync: wait up to 33ms for fresh frame, freeing Python GIL for socket ingest
+            new_frame_event.wait(timeout=0.033)
+            new_frame_event.clear()
 
             is_connected = receiver.is_connected
             frame = latest_frame[0]
@@ -469,6 +492,20 @@ def main():
                 else:
                     display_frame = frame
             else:
+                # Rule 2: If targeted IP is not responding for more than 10 seconds, only then look up
+                now_perf = time.time()
+                last_pkt = receiver.last_packet_time
+                if last_pkt == 0.0 or (now_perf - last_pkt > 10.0):
+                    drone_data = registry_client.lookup_if_unresponsive(
+                        drone_id="DRONE-001",
+                        last_response_time=last_pkt,
+                        unresponsive_threshold_s=10.0,
+                    )
+                    if drone_data and drone_data.get("ipv6"):
+                        discovered_ip = drone_data.get("ipv6")
+                        discovered_port = drone_data.get("port", 5005)
+                        print(f"[REGISTRY] Discovered Drone at [{discovered_ip}]:{discovered_port}", flush=True)
+
                 display_frame = draw_waiting_screen(
                     counter=counter,
                     state=receiver.connection_state,

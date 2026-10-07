@@ -99,8 +99,19 @@ class MainActivity : AppCompatActivity() {
         initViews()
         loadPreferences()
         checkPermissions()
+
+        DroneRegistryManager.onTargetDiscovered = { ip, port ->
+            if (!isStreaming) {
+                etTargetIp.setText(ip)
+                etTargetPort.setText(port.toString())
+                saveCurrentPreferences()
+                updateIdleStatusDetail()
+            }
+        }
+
         startAutomaticRegistrySync()
-        syncTargetFromRegistry()
+        // Request latest counterpart app's IP from Vercel on initialization
+        syncTargetFromRegistry(force = true)
     }
 
     private fun initViews() {
@@ -284,21 +295,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startStream() {
-        val ip = etTargetIp.text.toString().trim()
-        val port = etTargetPort.text.toString().trim().toIntOrNull() ?: 5005
+        var ip = etTargetIp.text.toString().trim()
+        val discovered = DroneRegistryManager.lastDiscoveredTargetIp
+        if ((ip.isEmpty() || ip == DEFAULT_TARGET_IP) && !discovered.isNullOrEmpty()) {
+            ip = discovered
+            etTargetIp.setText(discovered)
+        }
+        val port = etTargetPort.text.toString().trim().toIntOrNull() ?: DroneRegistryManager.lastDiscoveredTargetPort
         val espIp = etEspIp.text.toString().trim()
         val telemPort = etTelemPort.text.toString().trim().toIntOrNull() ?: 14551
         val enableTelem = cbEnableTelem.isChecked
 
         if (ip.isEmpty()) {
-            Toast.makeText(this, "Please enter target IP", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Please enter target IP or wait for discovery...", Toast.LENGTH_SHORT).show()
             return
         }
 
         saveCurrentPreferences()
 
-        // Auto-register drone to Vercel discovery registry so Ground Station can always find it
-        DroneRegistryManager.registerDrone(port = port) { _, _, _ -> }
+        // Check if carrier IP changed before streaming (zero-request if unchanged)
+        DroneRegistryManager.checkAndUpdateIpv6(port = port)
 
         val fps = if (rbFps60.isChecked) 60 else 30
         val isAuto = rbAuto.isChecked
@@ -494,7 +510,8 @@ class MainActivity : AppCompatActivity() {
         } else {
             registerReceiver(statsReceiver, filter)
         }
-        syncTargetFromRegistry()
+        // Rule 2: Only look up if ground station has been unresponsive for > 10s
+        syncTargetFromRegistry(force = false)
     }
 
     override fun onPause() {
@@ -504,8 +521,8 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) {}
     }
 
-    private fun syncTargetFromRegistry() {
-        DroneRegistryManager.lookupTarget(deviceId = "GROUND-001") { success, ipv6, port, isOnline, msg ->
+    private fun syncTargetFromRegistry(force: Boolean = false) {
+        val onResult: (Boolean, String?, Int?, Boolean, String) -> Unit = { success, ipv6, port, isOnline, msg ->
             if (success && ipv6 != null && !isStreaming) {
                 val currentText = etTargetIp.text.toString().trim()
                 if (currentText != ipv6) {
@@ -514,6 +531,17 @@ class MainActivity : AppCompatActivity() {
                     updateIdleStatusDetail()
                 }
             }
+        }
+
+        if (force) {
+            DroneRegistryManager.lookupTarget(deviceId = "GROUND-001", onResult = onResult)
+        } else {
+            // Rule 2: If targeted IP is not responding for more than 10 seconds, only then look up
+            DroneRegistryManager.lookupTargetIfUnresponsive(
+                targetDeviceId = "GROUND-001",
+                unresponsiveThresholdMs = 10_000L,
+                onResult = onResult
+            )
         }
     }
 
@@ -531,7 +559,10 @@ class MainActivity : AppCompatActivity() {
         DroneRegistryManager.startAutoSync(applicationContext, port = port) { msg, _ ->
             if (!isStreaming) {
                 tvStatusDetail.text = msg
-                syncTargetFromRegistry()
+                // Only look up if no target IP is set yet
+                if (etTargetIp.text.toString().trim().isEmpty()) {
+                    syncTargetFromRegistry(force = true)
+                }
             }
         }
     }

@@ -4,6 +4,14 @@ import { validateDeviceId } from "../lib/validate";
 import { listAllDevices, getDevice, deleteDevice } from "../lib/db";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-device-token, x-registration-secret, x-admin-key");
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
   if (req.method === "GET") {
     // List of all devices for registry dashboard & status monitoring
     const devices = await listAllDevices();
@@ -11,13 +19,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const nowMs = Date.now();
 
     const formatted = devices.map((d) => {
-      const diffSec = Math.max(0, Math.floor((nowMs - new Date(d.last_seen).getTime()) / 1000));
+      const lastSeenDate = d.last_seen ? new Date(d.last_seen) : new Date(0);
+      const lastSeenMs = isNaN(lastSeenDate.getTime()) ? 0 : lastSeenDate.getTime();
+      const diffSec = Math.max(0, Math.floor((nowMs - lastSeenMs) / 1000));
       return {
         ...d,
+        last_seen: isNaN(lastSeenDate.getTime()) ? new Date().toISOString() : lastSeenDate.toISOString(),
         isOnline: diffSec <= thresholdSec,
         secondsSinceLastSeen: diffSec,
       };
     });
+
+    // Edge Cache: prevent rapid repeated calls from hammering storage backend
+    res.setHeader("Cache-Control", "public, s-maxage=5, stale-while-revalidate=10");
 
     return res.status(200).json({ success: true, count: formatted.length, devices: formatted });
   }

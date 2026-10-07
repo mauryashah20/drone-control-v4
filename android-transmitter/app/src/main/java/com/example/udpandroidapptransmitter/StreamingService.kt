@@ -24,6 +24,7 @@ import android.view.Surface
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import org.json.JSONObject
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetSocketAddress
@@ -37,6 +38,9 @@ class StreamingService : Service() {
     companion object {
         const val TAG = "StreamingService"
         const val CHANNEL_ID = "drone_stream_channel"
+
+        @Volatile var activeInstance: StreamingService? = null
+            private set
 
         // Actions
         const val ACTION_START = "com.example.udpandroidapptransmitter.START"
@@ -141,7 +145,26 @@ class StreamingService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        activeInstance = this
         createNotificationChannel()
+    }
+
+    /**
+     * Dynamically updates the UDP streaming and MAVLink telemetry destination address
+     * (e.g. when Vercel pushes a peer IP update or during zero-touch discovery).
+     */
+    fun updateTargetAddress(newIp: String, newPort: Int) {
+        if (newIp.isBlank()) return
+        Log.i(TAG, "Dynamic target IP update -> [$newIp]:$newPort (was [$targetIp]:$targetPort)")
+        targetIp = newIp
+        targetPort = newPort
+        try {
+            udpTarget = InetSocketAddress(newIp, newPort)
+            telemetryBridge?.updateTargetIp(newIp)
+            Log.i(TAG, "Successfully updated target address to [$newIp]:$newPort")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed updating target address: ${e.message}")
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -289,12 +312,11 @@ class StreamingService : Service() {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, targetBitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, targetFps)
-            // 2-second keyframe interval: clean periodic IDR sync without continuous intra-refresh sweep distortion.
-            // On-demand keyframes (0xFF 0x02) from receiver handle packet loss instantly.
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            // 1-second keyframe interval: fast recovery from packet loss
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
 
-            // Pure FPV: VBR (Variable Bitrate) mode - ZERO buffer smoothing, zero lookahead delay!
-            setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+            // Pure FPV: CBR (Constant Bitrate) mode prevents sudden burst spikes that cause cellular bufferbloat!
+            setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
 
             // High Profile enables 8x8 DCT transform & CABAC entropy coding (eliminates blocky 4x4 macroblocks)
             try {
@@ -312,12 +334,10 @@ class StreamingService : Service() {
                 try { setInteger(MediaFormat.KEY_OPERATING_RATE, 240) } catch (_: Exception) {}
             }
 
-            // 2. Bound QP range to eliminate coarse blocky macroblock pixelation
+            // 2. Bound QP minimum for crisp baseline, but allow full upper range (up to 51) so frame sizes never explode during motion
             try {
                 setInteger("vendor.qti-ext-enc-qp-range.qp-i-min", 16)
-                setInteger("vendor.qti-ext-enc-qp-range.qp-i-max", 28)
                 setInteger("vendor.qti-ext-enc-qp-range.qp-p-min", 18)
-                setInteger("vendor.qti-ext-enc-qp-range.qp-p-max", 32)
             } catch (_: Exception) {}
 
             // 3. Android Low-latency & zero-lookahead flags
@@ -689,16 +709,31 @@ class StreamingService : Service() {
     private fun startUdpCommandListener(socket: DatagramSocket) {
         val exec = Executors.newSingleThreadExecutor()
         exec.execute {
-            val buf = ByteArray(64)
+            val buf = ByteArray(1024)
             val packet = DatagramPacket(buf, buf.size)
             while (isStreaming.get() && udpSocket == socket) {
                 try {
                     socket.receive(packet)
+                    DroneRegistryManager.markTargetResponded()
                     if (packet.length >= 2) {
                         // 0xFF 0x02: Keyframe request from laptop receiver
                         if (buf[0] == 0xFF.toByte() && buf[1] == 0x02.toByte()) {
                             Log.i(TAG, "Sync IDR frame requested by laptop receiver")
                             requestSyncFrame()
+                        } else if (buf[0] == 0xFF.toByte() && buf[1] == 0x55.toByte()) {
+                            // 0xFF 0x55: Automatic Peer IP Update Push packet from Vercel
+                            try {
+                                val jsonStr = String(buf, 2, packet.length - 2, Charsets.UTF_8)
+                                val obj = JSONObject(jsonStr)
+                                val newIp = obj.optString("ipv6")
+                                val newPort = obj.optInt("port", targetPort)
+                                if (newIp.isNotEmpty()) {
+                                    Log.i(TAG, "Vercel Push received: Ground station new IP [$newIp]:$newPort")
+                                    updateTargetAddress(newIp, newPort)
+                                }
+                            } catch (e: Exception) {
+                                Log.w(TAG, "Failed parsing peer update push: ${e.message}")
+                            }
                         }
                     }
                 } catch (_: Exception) {
@@ -982,6 +1017,9 @@ class StreamingService : Service() {
     }
 
     override fun onDestroy() {
+        if (activeInstance == this) {
+            activeInstance = null
+        }
         sendControlPacket(PACKET_APP_CLOSE, 3)
         stopStreaming()
         synchronized(stateLock) {

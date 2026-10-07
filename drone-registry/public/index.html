@@ -322,7 +322,12 @@
     }
 
     fetchDevices();
-    setInterval(fetchDevices, 5000);
+    // Low-frequency smart poll: only refresh every 30s when tab is active to preserve Vercel quota
+    setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        fetchDevices();
+      }
+    }, 30000);
   </script>
 </body>
 </html>

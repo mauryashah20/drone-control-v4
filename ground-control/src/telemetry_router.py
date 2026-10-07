@@ -1,4 +1,5 @@
 import os
+import sys
 import math
 import socket
 import select
@@ -149,6 +150,11 @@ class TelemetryRouter:
             bind_addr = self.phone_bind_ip if self.phone_bind_ip not in ("0.0.0.0", "") else "::"
             sock.bind((bind_addr, self.phone_bind_port))
             sock.setblocking(False)
+            if sys.platform == "win32":
+                try:
+                    sock.ioctl(0x9800000C, False)
+                except Exception:
+                    pass
             self._phone_sock = sock
         except Exception:
             try:
@@ -157,6 +163,11 @@ class TelemetryRouter:
                 bind_addr = self.phone_bind_ip if self.phone_bind_ip != "::" else "0.0.0.0"
                 sock.bind((bind_addr, self.phone_bind_port))
                 sock.setblocking(False)
+                if sys.platform == "win32":
+                    try:
+                        sock.ioctl(0x9800000C, False)
+                    except Exception:
+                        pass
                 self._phone_sock = sock
             except Exception as e:
                 self._log(f"Error binding phone UDP socket ({self.phone_bind_ip}:{self.phone_bind_port}): {e}")
@@ -168,10 +179,20 @@ class TelemetryRouter:
             self._mp_udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self._mp_udp_sock.bind(("127.0.0.1", self.mp_local_port))
             self._mp_udp_sock.setblocking(False)
+            if sys.platform == "win32":
+                try:
+                    self._mp_udp_sock.ioctl(0x9800000C, False)
+                except Exception:
+                    pass
         except Exception as e:
             self._log(f"Warning: binding MP local socket failed, falling back to ephemeral: {e}")
             self._mp_udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._mp_udp_sock.setblocking(False)
+            if sys.platform == "win32":
+                try:
+                    self._mp_udp_sock.ioctl(0x9800000C, False)
+                except Exception:
+                    pass
 
         # 3. Setup optional TCP server for TCP-based GCS connection
         if self.enable_tcp:

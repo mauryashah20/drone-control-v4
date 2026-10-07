@@ -22,9 +22,19 @@ export function validateIPv6(ip: unknown): ip is string {
 }
 
 /**
- * Port must be a non-zero integer in the valid UDP/TCP range.
+ * Port must be a non-zero integer in the valid UDP/TCP range (1-65535).
+ * Also accepts numeric strings like "5005".
  */
 export function validatePort(port: unknown): port is number {
-  if (typeof port !== "number") return false;
-  return Number.isInteger(port) && port >= 1 && port <= 65535;
+  const p = typeof port === "string" ? Number(port.trim()) : port;
+  if (typeof p !== "number" || isNaN(p)) return false;
+  return Number.isInteger(p) && p >= 1 && p <= 65535;
+}
+
+export function parsePort(port: unknown): number | null {
+  const p = typeof port === "string" ? Number(port.trim()) : port;
+  if (typeof p === "number" && Number.isInteger(p) && p >= 1 && p <= 65535) {
+    return p;
+  }
+  return null;
 }

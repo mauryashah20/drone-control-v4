@@ -1,8 +1,16 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-device-token, x-registration-secret, x-admin-key");
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
   if (req.method !== "GET") {
-    res.setHeader("Allow", ["GET"]);
+    res.setHeader("Allow", ["GET", "OPTIONS"]);
     return res.status(405).json({ success: false, error: "Method Not Allowed" });
   }
 

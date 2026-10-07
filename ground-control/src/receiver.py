@@ -1,3 +1,4 @@
+import sys
 import socket
 import struct
 import threading
@@ -17,6 +18,7 @@ PACKET_KEEP_ALIVE = b"\xFF\xAA\x55\x00"
 PACKET_HELLO = b"\xFF\x01\xCA\xFE"
 PACKET_GOODBYE = b"\xFF\xDE\xAD\x01"
 PACKET_APP_CLOSE = b"\xFF\xDE\xAD\x02"
+PACKET_PEER_UPDATE = b"\xFF\x55"
 
 
 class ConnectionState:
@@ -54,17 +56,19 @@ class ZeroLatencyVideoReceiver:
         on_frame: Optional[Callable[[np.ndarray, FrameStats], None]] = None,
         on_connection_change: Optional[Callable[[bool, str, Optional[str]], None]] = None,
         on_log: Optional[Callable[[str], None]] = None,
+        on_peer_update: Optional[Callable[[str, int], None]] = None,
     ) -> None:
         self.bind_ip = bind_ip
         self.port = port
         self.on_frame = on_frame
         self.on_connection_change = on_connection_change
         self.on_log = on_log
+        self.on_peer_update = on_peer_update
 
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
         self._decode_thread: Optional[threading.Thread] = None
-        self._decode_queue: queue.Queue = queue.Queue(maxsize=2)
+        self._decode_queue: queue.Queue = queue.Queue(maxsize=1)
         self._running = threading.Event()
         self._lock = threading.Lock()
 
@@ -75,9 +79,11 @@ class ZeroLatencyVideoReceiver:
         self.last_packet_time: float = 0.0
         self.last_connected_time: float = 0.0
         self._last_sender_addr: Optional[tuple] = None
+        self._last_sync_request_time: float = 0.0
 
-        # Decoder & Progressive Slice assembly
+        # Decoder & Progressive Slice assembly (Zero-Buffer Analog FPV Engine)
         self._decoder = self._create_decoder()
+        self._active_frame_seq: Optional[int] = None
         self._slice_chunks: Dict[int, Dict[int, Dict[int, bytes]]] = {}
         self._slice_chunk_totals: Dict[int, Dict[int, int]] = {}
         self._frame_total_slices: Dict[int, int] = {}
@@ -117,6 +123,7 @@ class ZeroLatencyVideoReceiver:
 
     def _reset_stream_state(self, reason: str = "") -> None:
         """Purges any partial chunks, resets sequence counters, and recreates the H.264 decoder."""
+        self._active_frame_seq = None
         self._slice_chunks.clear()
         self._slice_chunk_totals.clear()
         self._frame_total_slices.clear()
@@ -185,6 +192,13 @@ class ZeroLatencyVideoReceiver:
             except Exception:
                 pass
 
+    def _maybe_request_sync_frame(self) -> None:
+        """Throttled keyframe request triggered instantly upon packet loss / sequence gap."""
+        now = time.time()
+        if now - self._last_sync_request_time >= 0.25:
+            self._last_sync_request_time = now
+            self.request_sync_frame()
+
     def send_feedback(self, latency_ms: float) -> None:
         """Sends latency feedback back to transmitter for dynamic quality scaling."""
         if self._sock and self._last_sender_addr and self.is_connected:
@@ -225,24 +239,36 @@ class ZeroLatencyVideoReceiver:
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+                # 64KB OS receive buffer: holds ~1 frame max, OS sheds late packets instead of hoarding 25s of queue
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024)
             except OSError:
                 pass
             sock.settimeout(0.1)
             bind_addr = self.bind_ip if self.bind_ip not in ("0.0.0.0", "") else "::"
             sock.bind((bind_addr, self.port))
+            if sys.platform == "win32":
+                try:
+                    # SIO_UDP_CONNRESET: Prevent WSAECONNRESET (10054) on UDP socket from previous sendto
+                    sock.ioctl(0x9800000C, False)
+                except Exception:
+                    pass
             self._sock = sock
         except Exception:
             # Fallback to pure IPv4 socket
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024)
             except OSError:
                 pass
             sock.settimeout(0.1)
             bind_addr = self.bind_ip if self.bind_ip != "::" else "0.0.0.0"
             sock.bind((bind_addr, self.port))
+            if sys.platform == "win32":
+                try:
+                    sock.ioctl(0x9800000C, False)
+                except Exception:
+                    pass
             self._sock = sock
 
     def _close_socket(self) -> None:
@@ -271,7 +297,15 @@ class ZeroLatencyVideoReceiver:
                 self._last_sender_addr = addr
             except socket.timeout:
                 continue
-            except OSError:
+            except ConnectionResetError:
+                # Winsock ICMP Port Unreachable from feedback/sync frame packets — never kill daemon
+                continue
+            except OSError as e:
+                if getattr(e, "winerror", None) == 10054:
+                    continue
+                if self._running.is_set():
+                    time.sleep(0.005)
+                    continue
                 break
 
             if not data:
@@ -279,6 +313,22 @@ class ZeroLatencyVideoReceiver:
 
             # Handle Control / Keepalive packets
             if data[0] == CTRL_MAGIC:
+                # Automatic Peer IP Update Push packet from Vercel
+                if len(data) >= 2 and data[:2] == PACKET_PEER_UPDATE:
+                    try:
+                        import json
+                        payload = json.loads(data[2:].decode("utf-8"))
+                        peer_ip = payload.get("ipv6")
+                        peer_port = payload.get("port", 5005)
+                        if peer_ip:
+                            self._log(f"[RECEIVER] Vercel automatic peer push: Drone target updated to [{peer_ip}]:{peer_port}")
+                            self._last_sender_addr = (peer_ip, peer_port)
+                            if self.on_peer_update:
+                                self.on_peer_update(peer_ip, peer_port)
+                    except Exception as e:
+                        self._log(f"[RECEIVER] Error parsing Vercel peer push: {e}")
+                    continue
+
                 # Goodbye or App Close packet
                 if len(data) >= 4 and data[:3] == b"\xFF\xDE\xAD":
                     reason = "Transmitter stopped transmitting" if data[3] == 0x01 else "Transmitter app closed"
@@ -317,6 +367,12 @@ class ZeroLatencyVideoReceiver:
             frame_seq, slice_idx, total_slices, chunk_idx, total_chunks, ts_ms = struct.unpack_from(">IBBHHQ", data, 0)
             payload = data[HEADER_SIZE:]
 
+            # Analog FPV Stale Packet Shredder:
+            # Discard immediately if packet transit delay is older than 100ms
+            now_ms = int(now * 1000)
+            if ts_ms > 0 and (now_ms - ts_ms > 100):
+                continue
+
             with self._lock:
                 # Discard stale packets from frames already completed
                 if self._last_completed_seq is not None:
@@ -324,17 +380,26 @@ class ZeroLatencyVideoReceiver:
                     if 0 <= diff < 100:
                         continue
 
-                # Evict oldest incomplete frames if buffer has more than 4 frames
-                if frame_seq not in self._slice_chunks:
-                    if len(self._slice_chunks) > 4:
-                        oldest = min(self._slice_chunks.keys())
-                        self._dropped_frames += 1
-                        self._slice_chunks.pop(oldest, None)
-                        self._slice_chunk_totals.pop(oldest, None)
-                        self._frame_total_slices.pop(oldest, None)
-                        self._completed_slices.pop(oldest, None)
-                        self._frame_timestamps.pop(oldest, None)
+                # Zero-Buffer Instant Discard Rule:
+                # If a packet from a NEWER frame arrives while previous frame is incomplete,
+                # immediately drop the old frame, clear partial chunks, and trigger sync frame request!
+                if self._active_frame_seq is not None and frame_seq > self._active_frame_seq:
+                    gap = frame_seq - self._active_frame_seq
+                    self._dropped_frames += max(1, gap)
+                    self._slice_chunks.clear()
+                    self._slice_chunk_totals.clear()
+                    self._frame_total_slices.clear()
+                    self._completed_slices.clear()
+                    self._frame_timestamps.clear()
+                    self._maybe_request_sync_frame()
+                    self._active_frame_seq = frame_seq
+                elif self._active_frame_seq is None:
+                    self._active_frame_seq = frame_seq
+                elif frame_seq < self._active_frame_seq:
+                    # Packet belongs to an already discarded or dead frame
+                    continue
 
+                if frame_seq not in self._slice_chunks:
                     self._slice_chunks[frame_seq] = {}
                     self._slice_chunk_totals[frame_seq] = {}
                     self._frame_total_slices[frame_seq] = total_slices
@@ -360,10 +425,10 @@ class ZeroLatencyVideoReceiver:
                         # Reconstruct full frame from all slices in sequence
                         full_frame = b"".join(self._completed_slices[frame_seq][i] for i in range(expected_slices))
                         frame_ts = self._frame_timestamps.pop(frame_seq, ts_ms)
-                        self._slice_chunks.pop(frame_seq, None)
-                        self._slice_chunk_totals.pop(frame_seq, None)
-                        self._frame_total_slices.pop(frame_seq, None)
-                        self._completed_slices.pop(frame_seq, None)
+                        self._slice_chunks.clear()
+                        self._slice_chunk_totals.clear()
+                        self._frame_total_slices.clear()
+                        self._completed_slices.clear()
 
                         # Track dropped frame gaps
                         if self._last_completed_seq is not None:
@@ -373,7 +438,7 @@ class ZeroLatencyVideoReceiver:
 
                         self._last_completed_seq = frame_seq
 
-                        # Non-blocking handoff to decoder thread
+                        # Non-blocking handoff to decoder thread: drop any pending old frame immediately
                         try:
                             if self._decode_queue.full():
                                 try:

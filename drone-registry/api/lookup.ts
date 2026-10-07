@@ -3,9 +3,17 @@ import { validateDeviceId } from "../lib/validate";
 import { getDevice } from "../lib/db";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-device-token, x-registration-secret, x-admin-key");
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
   // Allow GET
   if (req.method !== "GET") {
-    res.setHeader("Allow", ["GET"]);
+    res.setHeader("Allow", ["GET", "OPTIONS"]);
     return res.status(405).json({ success: false, error: `Method ${req.method} Not Allowed` });
   }
 
@@ -32,10 +40,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     const thresholdSec = parseInt(process.env.ONLINE_THRESHOLD_SECONDS || "60", 10);
-    const lastSeenMs = new Date(device.last_seen).getTime();
+    const lastSeenDate = device.last_seen ? new Date(device.last_seen) : new Date();
+    const lastSeenMs = isNaN(lastSeenDate.getTime()) ? Date.now() : lastSeenDate.getTime();
     const nowMs = Date.now();
     const secondsSinceLastSeen = Math.max(0, Math.floor((nowMs - lastSeenMs) / 1000));
     const isOnline = secondsSinceLastSeen <= thresholdSec;
+
+    const updatedAtDate = device.updated_at ? new Date(device.updated_at) : lastSeenDate;
 
     // Cache control: Ground stations need fresh discovery data, cache for at most 3 seconds
     res.setHeader("Cache-Control", "public, s-maxage=3, max-age=3, stale-while-revalidate=5");
@@ -45,8 +56,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       deviceId: device.device_id,
       ipv6: device.ipv6,
       port: device.port,
-      lastSeen: device.last_seen.toISOString(),
-      updatedAt: device.updated_at.toISOString(),
+      lastSeen: isNaN(lastSeenDate.getTime()) ? new Date().toISOString() : lastSeenDate.toISOString(),
+      updatedAt: isNaN(updatedAtDate.getTime()) ? new Date().toISOString() : updatedAtDate.toISOString(),
       isOnline,
       secondsSinceLastSeen,
       onlineThresholdSeconds: thresholdSec,

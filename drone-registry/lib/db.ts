@@ -12,13 +12,33 @@ export interface DeviceRecord {
   updated_at: Date;
 }
 
-// In-memory fallback store when neither Postgres nor Vercel Blob is configured
+// In-memory fallback store when neither Postgres nor Vercel Blob is configured (or if Blob quota exhausted)
 const inMemoryStore = new Map<string, DeviceRecord>();
 
-function getStorageMode(): "postgres" | "blob" | "memory" {
+let blobQuotaExceeded = false;
+
+function markBlobError(err: any): void {
+  const msg = (err?.message || "").toLowerCase();
+  if (
+    msg.includes("quota") ||
+    msg.includes("limit") ||
+    msg.includes("exceeded") ||
+    msg.includes("403") ||
+    msg.includes("429") ||
+    err?.status === 403 ||
+    err?.status === 429
+  ) {
+    if (!blobQuotaExceeded) {
+      console.warn("[db] Vercel Blob request limit exhausted! Automatically switching to high-speed in-memory store.");
+    }
+    blobQuotaExceeded = true;
+  }
+}
+
+export function getStorageMode(): "postgres" | "blob" | "memory" {
   if (process.env.USE_MEMORY_DB === "true") return "memory";
   if (process.env.POSTGRES_URL) return "postgres";
-  if (process.env.BLOB_READ_WRITE_TOKEN) return "blob";
+  if (!blobQuotaExceeded && process.env.BLOB_READ_WRITE_TOKEN) return "blob";
   return "memory";
 }
 
@@ -65,17 +85,21 @@ export async function getDevice(deviceId: string): Promise<DeviceRecord | null> 
   if (mode === "blob") {
     try {
       const blob = await get(`devices/${deviceId}.json`, { access: "private" });
-      if (!blob || !blob.stream) return null;
-      const str = await text(blob.stream as any);
-      const data = JSON.parse(str);
-      return {
-        ...data,
-        last_seen: new Date(data.last_seen),
-        created_at: new Date(data.created_at),
-        updated_at: new Date(data.updated_at),
-      };
-    } catch {
-      return null;
+      if (blob && blob.stream) {
+        const str = await text(blob.stream as any);
+        const data = JSON.parse(str);
+        const record: DeviceRecord = {
+          ...data,
+          last_seen: new Date(data.last_seen),
+          created_at: new Date(data.created_at),
+          updated_at: new Date(data.updated_at),
+        };
+        inMemoryStore.set(deviceId, record);
+        return record;
+      }
+    } catch (err: any) {
+      markBlobError(err);
+      console.warn("[db] Blob getDevice failed, falling back to memory:", err?.message);
     }
   }
 
@@ -111,21 +135,27 @@ export async function upsertDevice(
   const mode = getStorageMode();
 
   if (mode === "blob") {
-    const existing = await getDevice(deviceId);
-    const record: DeviceRecord = {
-      device_id: deviceId,
-      ipv6,
-      port,
-      token_hash: tokenHash,
-      last_seen: now,
-      created_at: existing ? existing.created_at : now,
-      updated_at: now,
-    };
-    await put(`devices/${deviceId}.json`, JSON.stringify(record), {
-      access: "private",
-      allowOverwrite: true,
-    });
-    return record;
+    try {
+      const existing = await getDevice(deviceId);
+      const record: DeviceRecord = {
+        device_id: deviceId,
+        ipv6,
+        port,
+        token_hash: tokenHash,
+        last_seen: now,
+        created_at: existing ? existing.created_at : now,
+        updated_at: now,
+      };
+      await put(`devices/${deviceId}.json`, JSON.stringify(record), {
+        access: "private",
+        allowOverwrite: true,
+      });
+      inMemoryStore.set(deviceId, record);
+      return record;
+    } catch (err: any) {
+      markBlobError(err);
+      console.warn("[db] Blob upsertDevice failed, saving to in-memory store:", err?.message);
+    }
   }
 
   if (mode === "postgres") {
@@ -174,19 +204,25 @@ export async function updateHeartbeat(
   const mode = getStorageMode();
 
   if (mode === "blob") {
-    const existing = await getDevice(deviceId);
-    if (!existing) return null;
+    try {
+      const existing = await getDevice(deviceId);
+      if (existing) {
+        existing.last_seen = now;
+        existing.updated_at = now;
+        if (ipv6 !== undefined) existing.ipv6 = ipv6;
+        if (port !== undefined) existing.port = port;
 
-    existing.last_seen = now;
-    existing.updated_at = now;
-    if (ipv6 !== undefined) existing.ipv6 = ipv6;
-    if (port !== undefined) existing.port = port;
-
-    await put(`devices/${deviceId}.json`, JSON.stringify(existing), {
-      access: "private",
-      allowOverwrite: true,
-    });
-    return existing;
+        await put(`devices/${deviceId}.json`, JSON.stringify(existing), {
+          access: "private",
+          allowOverwrite: true,
+        });
+        inMemoryStore.set(deviceId, existing);
+        return existing;
+      }
+    } catch (err: any) {
+      markBlobError(err);
+      console.warn("[db] Blob updateHeartbeat failed, updating in-memory store:", err?.message);
+    }
   }
 
   if (mode === "postgres") {
@@ -197,6 +233,26 @@ export async function updateHeartbeat(
           SET last_seen = NOW(),
               updated_at = NOW(),
               ipv6 = ${ipv6},
+              port = ${port}
+          WHERE device_id = ${deviceId}
+          RETURNING device_id, ipv6, port, token_hash, last_seen, created_at, updated_at;
+        `;
+        return result.rows[0] || null;
+      } else if (ipv6 !== undefined) {
+        const result = await sql<DeviceRecord>`
+          UPDATE devices
+          SET last_seen = NOW(),
+              updated_at = NOW(),
+              ipv6 = ${ipv6}
+          WHERE device_id = ${deviceId}
+          RETURNING device_id, ipv6, port, token_hash, last_seen, created_at, updated_at;
+        `;
+        return result.rows[0] || null;
+      } else if (port !== undefined) {
+        const result = await sql<DeviceRecord>`
+          UPDATE devices
+          SET last_seen = NOW(),
+              updated_at = NOW(),
               port = ${port}
           WHERE device_id = ${deviceId}
           RETURNING device_id, ipv6, port, token_hash, last_seen, created_at, updated_at;
@@ -268,24 +324,35 @@ export async function listAllDevices(): Promise<Omit<DeviceRecord, "token_hash">
   if (mode === "blob") {
     try {
       const { blobs } = await list({ prefix: "devices/" });
-      const records: Omit<DeviceRecord, "token_hash">[] = [];
+      const results = await Promise.allSettled(
+        blobs.map(async (b) => {
+          try {
+            const blobData = await get(b.url, { access: "private" });
+            if (!blobData || !blobData.stream) return null;
+            const str = await text(blobData.stream as any);
+            const { token_hash, ...rest } = JSON.parse(str);
+            return {
+              ...rest,
+              last_seen: new Date(rest.last_seen),
+              created_at: new Date(rest.created_at),
+              updated_at: new Date(rest.updated_at),
+            } as Omit<DeviceRecord, "token_hash">;
+          } catch {
+            return null;
+          }
+        })
+      );
 
-      for (const b of blobs) {
-        const blobData = await get(b.url, { access: "private" });
-        if (blobData && blobData.stream) {
-          const str = await text(blobData.stream as any);
-          const { token_hash, ...rest } = JSON.parse(str);
-          records.push({
-            ...rest,
-            last_seen: new Date(rest.last_seen),
-            created_at: new Date(rest.created_at),
-            updated_at: new Date(rest.updated_at),
-          });
+      const records: Omit<DeviceRecord, "token_hash">[] = [];
+      for (const res of results) {
+        if (res.status === "fulfilled" && res.value) {
+          records.push(res.value);
         }
       }
       return records.sort((a, b) => b.last_seen.getTime() - a.last_seen.getTime());
     } catch (err: any) {
-      console.warn("[db] Blob listAllDevices failed:", err?.message);
+      markBlobError(err);
+      console.warn("[db] Blob listAllDevices failed, falling back to memory:", err?.message);
     }
   }
 
@@ -296,7 +363,12 @@ export async function listAllDevices(): Promise<Omit<DeviceRecord, "token_hash">
         FROM devices
         ORDER BY last_seen DESC;
       `;
-      return result.rows;
+      return result.rows.map((row) => ({
+        ...row,
+        last_seen: new Date(row.last_seen),
+        created_at: new Date(row.created_at),
+        updated_at: new Date(row.updated_at),
+      }));
     } catch (err: any) {
       console.warn("[db] Postgres listAllDevices failed:", err?.message);
     }

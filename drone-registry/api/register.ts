@@ -1,20 +1,30 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { validateDeviceId, validateIPv6, validatePort } from "../lib/validate";
+import { validateDeviceId, validateIPv6, parsePort } from "../lib/validate";
 import { hashToken, verifyToken, extractBearerToken } from "../lib/auth";
 import { inspectIpv6Source, isGlobalUnicastIPv6 } from "../lib/ip";
 import { getDevice, upsertDevice } from "../lib/db";
+import { notifyPeerOverUdp } from "../lib/push";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-device-token, x-registration-secret, x-admin-key");
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
   // Enforce POST method
   if (req.method !== "POST") {
-    res.setHeader("Allow", ["POST"]);
+    res.setHeader("Allow", ["POST", "OPTIONS"]);
     return res.status(405).json({ success: false, error: `Method ${req.method} Not Allowed` });
   }
 
   try {
     const rawDeviceId = req.body?.deviceId;
     const deviceId = typeof rawDeviceId === "string" ? rawDeviceId.trim().toUpperCase().replace(/\s+/g, "") : "";
-    const { ipv6, port, token } = req.body || {};
+    const { ipv6, token } = req.body || {};
+    const rawPort = req.body?.port;
 
     // 1. Validate deviceId
     if (!validateDeviceId(deviceId)) {
@@ -40,7 +50,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // 3. Validate Port
-    if (!validatePort(port)) {
+    const port = parsePort(rawPort);
+    if (port === null) {
       return res.status(400).json({
         success: false,
         error: "Invalid port: must be an integer between 1 and 65535",
@@ -102,6 +113,40 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // 6. Upsert device record into database
     const saved = await upsertDevice(deviceId, ipv6, port, tokenHashToStore);
 
+    // 7. Automatic Peer Notification:
+    // If the counterpart peer device is registered, send a direct UDP update push
+    const requestedPeerId = typeof req.body?.peerDeviceId === "string" ? req.body.peerDeviceId.trim().toUpperCase() : null;
+    const defaultPeerId = deviceId === "DRONE-001" ? "GROUND-001" : deviceId === "GROUND-001" ? "DRONE-001" : null;
+    const targetPeerId = requestedPeerId || defaultPeerId;
+
+    let peerTarget: { deviceId: string; ipv6: string; port: number; lastSeen: number } | null = null;
+    let peerNotified = false;
+
+    if (targetPeerId) {
+      try {
+        const peerDevice = await getDevice(targetPeerId);
+        if (peerDevice) {
+          peerTarget = {
+            deviceId: peerDevice.device_id,
+            ipv6: peerDevice.ipv6,
+            port: peerDevice.port,
+            lastSeen: peerDevice.last_seen instanceof Date ? peerDevice.last_seen.getTime() : new Date(peerDevice.last_seen).getTime(),
+          };
+
+          // Trigger automatic UDP push of the new IP to the counterpart device
+          peerNotified = await notifyPeerOverUdp(peerDevice.ipv6, peerDevice.port, {
+            type: "PEER_IP_UPDATE",
+            deviceId: saved.device_id,
+            ipv6: saved.ipv6,
+            port: saved.port,
+            timestamp: Date.now(),
+          });
+        }
+      } catch (err: any) {
+        console.warn("[register] Peer notification warning:", err?.message);
+      }
+    }
+
     return res.status(200).json({
       success: true,
       deviceId: saved.device_id,
@@ -111,6 +156,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       sourceIpMatches: ipInspection.sourceIpMatches,
       observedEdgeIp: ipInspection.observedEdgeIp,
       notes: ipInspection.notes,
+      peerTarget,
+      peerNotified,
       message: "Device registered successfully",
     });
   } catch (error: any) {

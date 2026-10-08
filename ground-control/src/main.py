@@ -375,6 +375,8 @@ def main():
 
     smoothed_lat = [30.0]
     last_feedback_time = [0.0]
+    lookup_in_progress = [False]
+    last_lookup_attempt = [0.0]
     new_frame_event = threading.Event()
 
     def on_frame_callback(frame: np.ndarray, stats: FrameStats):
@@ -454,19 +456,29 @@ def main():
                 else:
                     display_frame = frame
             else:
-                # Rule 2: If targeted IP is not responding for more than 10 seconds, only then look up
+                # Non-blocking background lookup when unresponsive (>10s) without freezing GUI
                 now_perf = time.time()
                 last_pkt = receiver.last_packet_time
-                if last_pkt == 0.0 or (now_perf - last_pkt > 10.0):
-                    drone_data = registry_client.lookup_if_unresponsive(
-                        drone_id="DRONE-001",
-                        last_response_time=last_pkt,
-                        unresponsive_threshold_s=10.0,
-                    )
-                    if drone_data and drone_data.get("ipv6"):
-                        discovered_ip = drone_data.get("ipv6")
-                        discovered_port = drone_data.get("port", 5005)
-                        print(f"[REGISTRY] Discovered Drone at [{discovered_ip}]:{discovered_port}", flush=True)
+                if (last_pkt == 0.0 or (now_perf - last_pkt > 10.0)) and not lookup_in_progress[0]:
+                    if now_perf - last_lookup_attempt[0] > 10.0:
+                        last_lookup_attempt[0] = now_perf
+                        lookup_in_progress[0] = True
+
+                        def _bg_drone_lookup():
+                            try:
+                                d_data = registry_client.lookup_drone("DRONE-001", timeout=3.0)
+                                if d_data and d_data.get("ipv6"):
+                                    d_ip = d_data.get("ipv6")
+                                    d_p = d_data.get("port", 5005)
+                                    print(f"[REGISTRY] Discovered Drone at [{d_ip}]:{d_p}", flush=True)
+                                    if registry_client.on_peer_update:
+                                        registry_client.on_peer_update(d_ip, d_p)
+                            except Exception:
+                                pass
+                            finally:
+                                lookup_in_progress[0] = False
+
+                        threading.Thread(target=_bg_drone_lookup, daemon=True, name="BG-DroneLookup").start()
 
                 display_frame = draw_waiting_screen(
                     counter=counter,

@@ -87,7 +87,7 @@ class ZeroLatencyVideoReceiver:
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
         self._decode_thread: Optional[threading.Thread] = None
-        self._decode_queue: queue.Queue = queue.Queue(maxsize=2)
+        self._decode_queue: queue.Queue = queue.Queue(maxsize=16)
         self._running = threading.Event()
         self._lock = threading.Lock()
 
@@ -104,7 +104,7 @@ class ZeroLatencyVideoReceiver:
         self._active_codec_name = "hevc"
         self._decoder = self._create_decoder(self._active_codec_name)
         self._frames: Dict[int, FrameBuffer] = {}
-        self.jitter_buffer_ms: float = 40.0
+        self.jitter_buffer_ms: float = 60.0
         self._highest_seen_seq: int = -1
         self._last_completed_seq: Optional[int] = None
         self._last_decoded_seq: Optional[int] = None
@@ -153,6 +153,42 @@ class ZeroLatencyVideoReceiver:
         decoder.thread_count = 1
         decoder.options = {"err_detect": "compliant"}
         return decoder
+
+    @staticmethod
+    def _is_keyframe(raw_bytes: bytes, codec: str = "hevc") -> bool:
+        """Inspects Annex B NAL unit headers to detect IDR/CRA/VPS/SPS keyframes."""
+        if not raw_bytes or len(raw_bytes) < 5:
+            return False
+        n = min(len(raw_bytes), 256)
+        i = 0
+        while i < n - 4:
+            if raw_bytes[i] == 0 and raw_bytes[i + 1] == 0:
+                if raw_bytes[i + 2] == 1:
+                    nal_b = raw_bytes[i + 3]
+                    if codec == "hevc":
+                        nal_type = (nal_b >> 1) & 0x3F
+                        if nal_type in (19, 20, 21, 32, 33):  # IDR_W_RADL, IDR_N_LP, CRA_NUT, VPS, SPS
+                            return True
+                    else:
+                        nal_type = nal_b & 0x1F
+                        if nal_type in (5, 7):  # IDR slice, SPS
+                            return True
+                    i += 4
+                    continue
+                elif raw_bytes[i + 2] == 0 and raw_bytes[i + 3] == 1 and i + 4 < n:
+                    nal_b = raw_bytes[i + 4]
+                    if codec == "hevc":
+                        nal_type = (nal_b >> 1) & 0x3F
+                        if nal_type in (19, 20, 21, 32, 33):
+                            return True
+                    else:
+                        nal_type = nal_b & 0x1F
+                        if nal_type in (5, 7):
+                            return True
+                    i += 5
+                    continue
+            i += 1
+        return False
 
     def _reset_stream_state(self, reason: str = "") -> None:
         """Purges pending frames, resets sequence trackers, clock skew, and re-initializes decoder."""
@@ -423,8 +459,8 @@ class ZeroLatencyVideoReceiver:
                 # Expire incomplete frames whose jitter buffer window has elapsed
                 to_drop = [
                     seq for seq, fb in self._frames.items()
-                    if (self._highest_seen_seq > seq and (now_perf - fb.arrival_ts) * 1000.0 >= self.jitter_buffer_ms)
-                    or ((now_perf - fb.arrival_ts) > 0.200)
+                    if (self._highest_seen_seq > seq and (now_perf - fb.arrival_ts) * 1000.0 >= (120.0 if fb.is_key else self.jitter_buffer_ms))
+                    or ((now_perf - fb.arrival_ts) > 0.250)
                 ]
                 for seq in to_drop:
                     self._incomplete_frames += 1
@@ -445,6 +481,8 @@ class ZeroLatencyVideoReceiver:
                         last_c_len = struct.unpack_from(">H", payload, 0)[0]
                         fb.parity = (last_c_len, payload[2:])
                 else:
+                    if chunk_idx >= fb.total_chunks:
+                        continue
                     if chunk_idx in fb.chunks:
                         self._dup_packets += 1
                         continue
@@ -467,7 +505,7 @@ class ZeroLatencyVideoReceiver:
                         num_chunks = len(fb.chunks)
 
                 # Check if all chunks arrived / recovered
-                if num_chunks == fb.total_chunks:
+                if num_chunks == fb.total_chunks and all(i in fb.chunks for i in range(fb.total_chunks)):
                     full_frame = b"".join(fb.chunks[i] for i in range(fb.total_chunks))
                     frame_ts = fb.sender_ts_ms
                     is_key = fb.is_key
@@ -488,17 +526,22 @@ class ZeroLatencyVideoReceiver:
                     self._last_completed_seq = frame_seq
 
                     # Non-blocking handoff to decoder thread
-                    try:
-                        if self._decode_queue.full():
+                    # Flush backlog only if queue is accumulated (> 6 frames / ~100ms) to maintain ultra-low latency
+                    if self._decode_queue.qsize() > 6:
+                        flushed = 0
+                        while not self._decode_queue.empty():
                             try:
                                 self._decode_queue.get_nowait()
-                                self._dropped_frames += 1
-                                self._reference_lost = True
-                                self._maybe_request_sync_frame()
+                                flushed += 1
                             except queue.Empty:
-                                pass
+                                break
+                        self._dropped_frames += flushed
+                        self._reference_lost = True
+                        self._maybe_request_sync_frame()
+
+                    try:
                         self._decode_queue.put_nowait((frame_seq, full_frame, frame_ts, is_key))
-                    except Exception:
+                    except queue.Full:
                         pass
 
     def _decode_worker(self) -> None:
@@ -533,8 +576,12 @@ class ZeroLatencyVideoReceiver:
         # G2G transit latency: 25ms physical air-interface baseline + network queue jitter
         transit_latency = max(15.0, min(250.0, jitter + 25.0))
 
-        # Reference-frame corruption guard
-        if is_key_hint:
+        # Determine if this frame is a keyframe (check packet header flag + Annex B NAL headers)
+        is_key = is_key_hint or self._is_keyframe(raw_bytes, self._active_codec_name)
+
+        # Reference-frame corruption guard:
+        # NEVER feed corrupted P-frames to FFmpeg decoder when reference is lost!
+        if is_key:
             if self._reference_lost:
                 self._recovery_events += 1
             self._reference_lost = False
@@ -544,10 +591,10 @@ class ZeroLatencyVideoReceiver:
             self._dropped_frames += 1
             self._lost_frames_suppressed += 1
             self._maybe_request_sync_frame()
-            if self._lost_frames_suppressed > 6:
-                self._reference_lost = False
-            else:
-                return
+            if self._lost_frames_suppressed > 120:
+                self._reset_stream_state("keyframe timeout")
+                self.request_sync_frame()
+            return
 
         try:
             packet = av.packet.Packet(raw_bytes)

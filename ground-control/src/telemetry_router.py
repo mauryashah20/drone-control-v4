@@ -239,10 +239,13 @@ class TelemetryRouter:
                                 for client in self._tcp_clients:
                                     try:
                                         client.sendall(data)
+                                    except (BlockingIOError, InterruptedError):
+                                        pass  # Non-blocking backpressure: do not disconnect client
                                     except Exception:
                                         dead_clients.append(client)
                                 for dc in dead_clients:
-                                    self._tcp_clients.remove(dc)
+                                    if dc in self._tcp_clients:
+                                        self._tcp_clients.remove(dc)
                                     try:
                                         dc.close()
                                     except Exception:

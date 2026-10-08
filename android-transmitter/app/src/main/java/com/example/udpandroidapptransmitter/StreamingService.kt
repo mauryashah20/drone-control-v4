@@ -341,20 +341,11 @@ class StreamingService : Service() {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, targetBitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, targetFps)
-            // 4-second Keyframe interval: Receiver uses instant on-demand IDR requests (0xFF 0x02) on loss,
-            // preventing frequent 40-packet micro-bursts and CBR QP spikes every 1 second
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 4)
+            // 1-second Keyframe interval: Ensures rapid reference frame self-healing without bitrate explosion
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
 
             // Pure FPV: CBR (Constant Bitrate) mode prevents sudden burst spikes that cause cellular bufferbloat!
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-
-            // Bound QP range: prevents Qualcomm CBR controller from blowing up I-frame QP to 51 (which causes white-out washouts)
-            try {
-                setInteger("vendor.qti-ext-enc-qp-range.qp-i-min", 16)
-                setInteger("vendor.qti-ext-enc-qp-range.qp-p-min", 18)
-                setInteger("vendor.qti-ext-enc-qp-range.qp-i-max", 35)
-                setInteger("vendor.qti-ext-enc-qp-range.qp-p-max", 40)
-            } catch (_: Exception) {}
 
             if (mimeType == MediaFormat.MIMETYPE_VIDEO_HEVC) {
                 try {
@@ -620,7 +611,6 @@ class StreamingService : Service() {
         var framesSentSinceReport: Long = 0
         var lastStatsTime = System.currentTimeMillis()
         var lastPacketSentTime = System.currentTimeMillis()
-        var cachedCodecConfig: ByteArray? = null
         // 2ms dequeue timeout: wakes up within 2ms of frame ready without CPU spin
         val dequeueTimeoutUs = 2_000L
 
@@ -646,15 +636,8 @@ class StreamingService : Service() {
                         val frameBytes = ByteArray(bufferInfo.size)
                         encodedBuffer.get(frameBytes)
 
-                        // Do not transmit standalone 40-byte CODEC_CONFIG headers as empty video frames
-                        val isConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
-                        if (isConfig) {
-                            cachedCodecConfig = frameBytes
-                            try { codec.releaseOutputBuffer(outIndex, false) } catch (_: Exception) {}
-                            continue
-                        }
-
-                        val isKey = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+                        val isKey = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0 ||
+                                    (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
                         val pkts = sendFrameChunkedUdp(frameBytes, sequence, now, isKey)
                         packetsSentSinceReport += pkts
                         bytesSentSinceReport += frameBytes.size
@@ -870,8 +853,7 @@ class StreamingService : Service() {
 
             // Micro-pacing between multi-chunk frames: prevents cellular modem & router FIFO queue drops
             if (totalChunks > 1) {
-                val paceNanos = if (totalChunks > 8) 120_000L else 40_000L
-                java.util.concurrent.locks.LockSupport.parkNanos(paceNanos)
+                java.util.concurrent.locks.LockSupport.parkNanos(40_000L) // 40 microseconds
             }
         }
 

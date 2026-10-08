@@ -157,7 +157,17 @@ def draw_hud(
     draw_hud_box(img, (12, bar_y - 8), (w - 12, h - 8), border_color=COLOR_GOLD_BRIGHT, fill_alpha=0.7)
 
     # Bottom-Left: Frame Drops & Count
-    draw_osd_text(img, f"DROPS: {stats.dropped_frames}  |  FRM: {stats.total_frames}", (22, h - 18), COLOR_TEXT_MUTED, scale=0.40, thickness=1)
+    lost_pkt = getattr(stats, "lost_packets", 0)
+    idr_cnt = getattr(stats, "idr_frames", 0)
+    fec_rec = getattr(stats, "fec_recovered", 0)
+    draw_osd_text(
+        img,
+        f"DROPS: {stats.dropped_frames}  |  FEC-REC: {fec_rec}  |  FRM: {stats.total_frames}  |  IDR: {idr_cnt}  |  LOST-PKT: {lost_pkt}",
+        (22, h - 18),
+        COLOR_TEXT_MUTED,
+        scale=0.36,
+        thickness=1,
+    )
 
     # Bottom-Center: Flight Instruments
     if telem and telem.is_heartbeat_fresh:
@@ -363,75 +373,25 @@ def main():
     show_hud = True
     show_crosshair = True
 
-    # 2-Second Moving Average Latency Tracker (pure rolling window, zero stickiness)
-    latency_samples = collections.deque()
-    min_observed_diff = [None]
-    min_observed_time = [0.0]
-    avg_latency_2s = [0.0]
+    smoothed_lat = [30.0]
     last_feedback_time = [0.0]
     new_frame_event = threading.Event()
-
-    def record_latency(sender_ts_ms: int):
-        if sender_ts_ms <= 0:
-            return
-        now_perf = time.time()
-        now_ms = int(now_perf * 1000)
-        raw_diff = float(now_ms - sender_ts_ms)
-
-        # Baseline calibration (tracks minimum physical transit + clock offset)
-        # Smoothly adapts to slow clock drift without harsh 60s spike resets
-        if min_observed_diff[0] is None:
-            min_observed_diff[0] = raw_diff
-            min_observed_time[0] = now_perf
-        elif raw_diff < min_observed_diff[0]:
-            min_observed_diff[0] = raw_diff
-            min_observed_time[0] = now_perf
-        elif now_perf - min_observed_time[0] > 10.0:
-            # Gentle drift tracking: relax baseline minimum upward by 1ms every 10s
-            min_observed_diff[0] += 1.0
-            min_observed_time[0] = now_perf
-
-        # Estimated one-way latency: baseline (~18ms at 60 FPS, ~38ms at 30 FPS) + transit / queuing delay
-        base_hardware_ms = 18.0 if (latest_stats[0] and latest_stats[0].fps > 45.0) else 38.0
-        instant_lat = max(10.0, base_hardware_ms + (raw_diff - min_observed_diff[0]))
-
-        # Add to rolling window
-        latency_samples.append((now_perf, instant_lat))
-
-        # Evict samples older than 2.0 seconds
-        cutoff = now_perf - 2.0
-        while latency_samples and latency_samples[0][0] < cutoff:
-            latency_samples.popleft()
-
-    def get_2s_avg_latency() -> float:
-        now_perf = time.time()
-        cutoff = now_perf - 2.0
-        while latency_samples and latency_samples[0][0] < cutoff:
-            latency_samples.popleft()
-        if not latency_samples:
-            return 0.0
-        return sum(l for _, l in latency_samples) / len(latency_samples)
 
     def on_frame_callback(frame: np.ndarray, stats: FrameStats):
         latest_frame[0] = frame
         latest_stats[0] = stats
-        if stats.sender_timestamp_ms > 0:
-            record_latency(stats.sender_timestamp_ms)
+        if stats.transit_latency_ms > 0:
+            if abs(smoothed_lat[0] - stats.transit_latency_ms) > 35.0:
+                smoothed_lat[0] = stats.transit_latency_ms
+            else:
+                smoothed_lat[0] = smoothed_lat[0] * 0.85 + stats.transit_latency_ms * 0.15
         new_frame_event.set()
 
     def on_connection_callback(connected: bool, reason: str, sender_str: Optional[str]):
         if not connected:
-            # Transmitter stopped or signal lost: reset frame display and calibration
             latest_frame[0] = None
             latest_stats[0] = None
-            min_observed_diff[0] = None
-            latency_samples.clear()
-            avg_latency_2s[0] = 0.0
-        else:
-            # Fresh connection established: ready for new stream calibration
-            min_observed_diff[0] = None
-            latency_samples.clear()
-            avg_latency_2s[0] = 0.0
+        smoothed_lat[0] = 30.0
         new_frame_event.set()
 
     receiver = ZeroLatencyVideoReceiver(
@@ -465,11 +425,11 @@ def main():
 
             if is_connected and frame is not None and stats is not None:
                 now_perf = time.time()
-                avg_latency_2s[0] = get_2s_avg_latency()
+                lat_display = smoothed_lat[0]
 
                 if now_perf - last_feedback_time[0] >= 0.1:
                     last_feedback_time[0] = now_perf
-                    receiver.send_feedback(avg_latency_2s[0])
+                    receiver.send_feedback(lat_display)
 
                 telem_state = telem_router.get_state()
 
@@ -477,7 +437,7 @@ def main():
                     display_frame = draw_hud(
                         frame.copy(),
                         stats,
-                        avg_latency_2s[0],
+                        lat_display,
                         sender_str=receiver.last_sender_str,
                         telem=telem_state,
                         show_crosshair=show_crosshair,

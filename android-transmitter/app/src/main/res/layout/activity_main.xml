@@ -369,6 +369,16 @@
                                 app:buttonTint="@color/radio_gold_tint" />
 
                             <RadioButton
+                                android:id="@+id/rb_720p"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:text="720p"
+                                android:textColor="@color/white_secondary"
+                                android:textSize="11sp"
+                                android:fontFamily="monospace"
+                                app:buttonTint="@color/radio_gold_tint" />
+
+                            <RadioButton
                                 android:id="@+id/rb_480p"
                                 android:layout_width="wrap_content"
                                 android:layout_height="wrap_content"

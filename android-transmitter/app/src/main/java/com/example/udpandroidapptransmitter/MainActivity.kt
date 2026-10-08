@@ -20,6 +20,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etTargetPort: EditText
     private lateinit var rgResolution: RadioGroup
     private lateinit var rbAuto: RadioButton
+    private lateinit var rb720p: RadioButton
     private lateinit var rb480p: RadioButton
     private lateinit var rb360p: RadioButton
     private lateinit var tvResolutionLabel: TextView
@@ -119,6 +120,7 @@ class MainActivity : AppCompatActivity() {
         etTargetPort = findViewById(R.id.et_target_port)
         rgResolution = findViewById(R.id.rg_resolution)
         rbAuto = findViewById(R.id.rb_auto)
+        rb720p = findViewById(R.id.rb_720p)
         rb480p = findViewById(R.id.rb_480p)
         rb360p = findViewById(R.id.rb_360p)
         tvResolutionLabel = findViewById(R.id.tv_resolution_label)
@@ -182,6 +184,10 @@ class MainActivity : AppCompatActivity() {
                 R.id.rb_auto -> {
                     tvResolutionLabel.text = "QUALITY: AUTO (L < 150ms)"
                     tvResolutionLabel.setTextColor(ContextCompat.getColor(this, R.color.gold_bright))
+                }
+                R.id.rb_720p -> {
+                    tvResolutionLabel.text = "QUALITY: 720p HD (1280x720)"
+                    tvResolutionLabel.setTextColor(ContextCompat.getColor(this, R.color.white_pure))
                 }
                 R.id.rb_480p -> {
                     tvResolutionLabel.text = "QUALITY: 480p FIXED (640x480)"
@@ -258,6 +264,7 @@ class MainActivity : AppCompatActivity() {
         etTargetIp.isEnabled = enabled
         etTargetPort.isEnabled = enabled
         rbAuto.isEnabled = enabled
+        rb720p.isEnabled = enabled
         rb480p.isEnabled = enabled
         rb360p.isEnabled = enabled
         rbFps60.isEnabled = enabled
@@ -283,7 +290,8 @@ class MainActivity : AppCompatActivity() {
     private fun updateIdleStatusDetail() {
         if (!isStreaming) {
             val qualityStr = when {
-                rbAuto.isChecked -> "Auto Quality (640x480 adaptive)"
+                rbAuto.isChecked -> "Auto Quality (Adaptive 720p/480p)"
+                rb720p.isChecked -> "Fixed 720p HD (1280x720)"
                 rb480p.isChecked -> "Fixed 480p (640x480)"
                 else -> "Fixed 360p (640x360)"
             }
@@ -321,17 +329,22 @@ class MainActivity : AppCompatActivity() {
 
         val (width, height, bitrate) = when {
             isAuto -> {
-                // Auto mode: high-detail 480p tuned for crisp 4G/5G (1.8 Mbps @ 60fps, 1.4 Mbps @ 30fps)
+                // Auto mode: high-efficiency 720p HEVC (1.8 Mbps @ 60fps, 1.4 Mbps @ 30fps)
                 val br = if (fps == 60) 1_800_000 else 1_400_000
-                Triple(640, 480, br)
+                Triple(1280, 720, br)
             }
-            rb360p.isChecked -> {
-                val br = if (fps == 60) 1_100_000 else 800_000
-                Triple(640, 360, br)
+            rb720p.isChecked -> {
+                // Fixed 720p HD: crystal-clear low-packet feed (1.8 Mbps @ 60fps, 1.4 Mbps @ 30fps)
+                val br = if (fps == 60) 1_800_000 else 1_400_000
+                Triple(1280, 720, br)
+            }
+            rb480p.isChecked -> {
+                val br = if (fps == 60) 1_500_000 else 1_100_000
+                Triple(640, 480, br)
             }
             else -> {
-                val br = if (fps == 60) 2_400_000 else 1_800_000
-                Triple(640, 480, br)
+                val br = if (fps == 60) 900_000 else 650_000
+                Triple(640, 360, br)
             }
         }
 
@@ -459,6 +472,7 @@ class MainActivity : AppCompatActivity() {
 
         val quality = prefs.getString("selected_quality", "auto")
         when (quality) {
+            "720p" -> rb720p.isChecked = true
             "480p" -> rb480p.isChecked = true
             "360p" -> rb360p.isChecked = true
             else -> rbAuto.isChecked = true
@@ -481,6 +495,7 @@ class MainActivity : AppCompatActivity() {
         val telemPort = etTelemPort.text.toString().trim().toIntOrNull() ?: 14551
         val enableTelem = cbEnableTelem.isChecked
         val quality = when {
+            rb720p.isChecked -> "720p"
             rb480p.isChecked -> "480p"
             rb360p.isChecked -> "360p"
             else -> "auto"

@@ -115,11 +115,13 @@ class StreamingService : Service() {
     private var btDeviceName = "APM-Bridge"
     private var telemetryPort = 14551
 
-    // Packet buffers - 1150 bytes safe MTU avoids cellular carrier fragmentation
-    private val mtuBytes = 1150
-    private val headerSize = 18 // 4 frame_seq + 1 slice_idx + 1 total_slices + 2 chunk_idx + 2 total_chunks + 8 ts_ms
-    private val payloadMtu = mtuBytes - headerSize
+    // Packet buffers - 1200 bytes safe carrier IPv6 MTU (eliminates cellular GTP-tunnel drops)
+    private val mtuBytes = 1200
+    private val headerSize = 18 // 4 frame_seq + 1 flags/slice_idx + 1 total_slices + 2 chunk_idx + 2 total_chunks + 8 ts_ms
+    private val payloadMtu = 1180
     private val videoPacketBuffer = ByteArray(2048)
+    private val fecParityBuffer = ByteArray(2048)
+    private val parityData = ByteArray(1180)
 
     private var wakeLock: android.os.PowerManager.WakeLock? = null
 
@@ -245,9 +247,9 @@ class StreamingService : Service() {
             try {
                 udpSocket = DatagramSocket().apply {
                     try {
-                        // Pure FPV: Small socket send buffer (32KB) prevents Android OS kernel
-                        // from queueing stale video packets during cellular jitter bursts
-                        sendBufferSize = 32 * 1024
+                        // High-throughput FPV: 512KB send buffer prevents Android OS kernel
+                        // from dropping UDP packet bursts during 720p multi-chunk keyframe bursts
+                        sendBufferSize = 512 * 1024
                     } catch (_: Exception) {}
                 }
                 udpTarget = InetSocketAddress(targetIp, targetPort)
@@ -368,15 +370,7 @@ class StreamingService : Service() {
                 try { setInteger(MediaFormat.KEY_OPERATING_RATE, 240) } catch (_: Exception) {}
             }
 
-            // 2. Bound QP range for crisp razor-sharp baseline and solid motion stability
-            try {
-                setInteger("vendor.qti-ext-enc-qp-range.qp-i-min", 14)
-                setInteger("vendor.qti-ext-enc-qp-range.qp-p-min", 16)
-                setInteger("vendor.qti-ext-enc-qp-range.qp-i-max", 38)
-                setInteger("vendor.qti-ext-enc-qp-range.qp-p-max", 42)
-            } catch (_: Exception) {}
-
-            // 3. Android Low-latency & zero-lookahead flags
+            // Low-latency & zero-lookahead flags
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             }
@@ -389,21 +383,7 @@ class StreamingService : Service() {
                 setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
             }
 
-            // 4. Qualcomm hardware low-latency extensions
             try { setInteger("vendor.qti-ext-enc-low-latency.enable", 1) } catch (_: Exception) {}
-
-            // 5. Standard IDR keyframe mode: ensures full clean frames without gray/black intra-refresh mosaic artifacts
-            try { setInteger("vendor.qti-ext-enc-intra-refresh.mode", 0) } catch (_: Exception) {}
-
-            // 6. Initial QP override: start at crisp quality immediately
-            try {
-                setInteger("vendor.qti-ext-enc-initial-qp.qp-i", 18)
-                setInteger("vendor.qti-ext-enc-initial-qp.qp-p", 20)
-            } catch (_: Exception) {}
-
-            try {
-                setInteger("vendor.qti-ext-enc-caps-ltr.max-count", 0)
-            } catch (_: Exception) {}
         }
 
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -546,23 +526,14 @@ class StreamingService : Service() {
             addTarget(surface)
 
             set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+            set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+            set(CaptureRequest.CONTROL_AE_LOCK, false)
+            set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
+            set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
 
+            // Dynamic tone mapping and contrast
             if (isAutoContrast) {
-                // ── Auto Contrast & Exposure Mode ─────────────────────────────────
-                // Enables hardware ISP auto-exposure metering and dynamic range
-                // compression tone-mapping so indoor and outdoor lighting conditions
-                // do not clip highlights or plunge shadows into black.
-                set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
-                set(CaptureRequest.CONTROL_AE_LOCK, false)
-                set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
-                set(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_FAST)
-            } else {
-                // ── Manual Exposure Lock (Fallback) ───────────────────────────────
-                set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
-                set(CaptureRequest.SENSOR_EXPOSURE_TIME, 8_000_000L)       // 8ms in nanoseconds
-                set(CaptureRequest.SENSOR_SENSITIVITY, 800)                 // ISO 800
-                val frameDurationNs = (1_000_000_000L / fpsRange.upper).coerceAtLeast(8_000_001L)
-                set(CaptureRequest.SENSOR_FRAME_DURATION, frameDurationNs)
                 set(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_FAST)
             }
 
@@ -576,18 +547,8 @@ class StreamingService : Service() {
                 set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF)
             }
 
-            set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
-            set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
-
             set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_FAST)
             set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_FAST)
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                try { set(CaptureRequest.DISTORTION_CORRECTION_MODE, CameraMetadata.DISTORTION_CORRECTION_MODE_OFF) } catch (_: Exception) {}
-            }
-            set(CaptureRequest.HOT_PIXEL_MODE, CameraMetadata.HOT_PIXEL_MODE_OFF)
-            set(CaptureRequest.SHADING_MODE, CameraMetadata.SHADING_MODE_OFF)
-            set(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CameraMetadata.COLOR_CORRECTION_ABERRATION_MODE_OFF)
         }.build()
     }
 
@@ -675,7 +636,9 @@ class StreamingService : Service() {
                         val frameBytes = ByteArray(bufferInfo.size)
                         encodedBuffer.get(frameBytes)
 
-                        val pkts = sendFrameChunkedUdp(frameBytes, sequence, now)
+                        val isKey = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0 ||
+                                    (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                        val pkts = sendFrameChunkedUdp(frameBytes, sequence, now, isKey)
                         packetsSentSinceReport += pkts
                         bytesSentSinceReport += frameBytes.size
                         framesSentSinceReport += 1
@@ -776,7 +739,7 @@ class StreamingService : Service() {
     @Volatile private var lastRateAdjustmentTime = 0L
 
     fun updateBitrateOnTheFly(newBitrate: Int) {
-        val clamped = newBitrate.coerceIn(800_000, 3_000_000)
+        val clamped = newBitrate.coerceIn(600_000, 2_600_000)
         if (clamped == currentBitrate) return
         currentBitrate = clamped
         try {
@@ -793,24 +756,24 @@ class StreamingService : Service() {
     private fun handleLatencyFeedback(latencyMs: Int) {
         if (!isAutoQuality) return
         val now = System.currentTimeMillis()
-        if (now - lastRateAdjustmentTime < 150) return
+        if (now - lastRateAdjustmentTime < 300) return
 
-        if (latencyMs > 120) {
-            // Bufferbloat detected! Step down toward 800 kbps floor
-            val newBitrate = (currentBitrate * 0.80f).toInt().coerceAtLeast(800_000)
+        if (latencyMs > 130) {
+            // Bufferbloat detected! Step down toward 700 kbps floor
+            val newBitrate = (currentBitrate * 0.85f).toInt().coerceAtLeast(700_000)
             if (newBitrate < currentBitrate) {
                 lastRateAdjustmentTime = now
                 updateBitrateOnTheFly(newBitrate)
             }
-        } else if (latencyMs > 85) {
-            // Mild cellular queue buildup: gentle step down by 10%
-            val newBitrate = (currentBitrate * 0.90f).toInt().coerceAtLeast(950_000)
+        } else if (latencyMs > 105) {
+            // Mild cellular queue buildup: gentle step down by 8%
+            val newBitrate = (currentBitrate * 0.92f).toInt().coerceAtLeast(900_000)
             if (newBitrate < currentBitrate) {
                 lastRateAdjustmentTime = now
                 updateBitrateOnTheFly(newBitrate)
             }
-        } else if (latencyMs < 60 && (now - lastRateAdjustmentTime >= 400)) {
-            // Channel is clear and clean: smoothly probe bandwidth upward (+100 kbps)
+        } else if (latencyMs < 75 && (now - lastRateAdjustmentTime >= 800)) {
+            // Channel is clean and stable: smoothly probe bandwidth upward (+100 kbps)
             val newBitrate = (currentBitrate + 100_000).coerceAtMost(targetBitrate)
             if (newBitrate > currentBitrate) {
                 lastRateAdjustmentTime = now
@@ -819,10 +782,12 @@ class StreamingService : Service() {
         }
     }
 
+
     private fun requestSyncFrame() {
         try {
             val params = android.os.Bundle().apply {
-                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 1)
+                putInt("request-sync", 1)
             }
             encoder?.setParameters(params)
         } catch (_: Exception) {}
@@ -835,7 +800,8 @@ class StreamingService : Service() {
     private fun sendFrameChunkedUdp(
         frameBytes: ByteArray,
         sequence: Long,
-        timestampMs: Long
+        timestampMs: Long,
+        isKeyFrame: Boolean = false
     ): Int {
         val socket = udpSocket ?: return 0
         val target = udpTarget ?: return 0
@@ -847,24 +813,30 @@ class StreamingService : Service() {
         var packetsCount = 0
         var offset = 0
 
-        // 4G/5G subframe pacing calculation: smooth out packet arrivals over frame window
-        val frameDurationUs = 1_000_000L / targetFps.coerceAtLeast(1)
-        val paceIntervalNs = if (totalChunks > 1) {
-            ((frameDurationUs * 500L) / totalChunks).coerceIn(80_000L, 1_000_000L)
-        } else 0L
+        // Compute XOR parity across all chunks for 100% single-packet loss resilience
+        val lastChunkLen = totalSize - (totalChunks - 1) * payloadMtu
+        java.util.Arrays.fill(parityData, 0.toByte())
+        for (c in 0 until totalChunks) {
+            val cOff = c * payloadMtu
+            val cLen = if (c == totalChunks - 1) lastChunkLen else payloadMtu
+            for (i in 0 until cLen) {
+                parityData[i] = (parityData[i].toInt() xor frameBytes[cOff + i].toInt()).toByte()
+            }
+        }
 
+        // Send all regular data chunks
         for (chunkIdx in 0 until totalChunks) {
-            val chunkSize = minOf(payloadMtu, totalSize - offset)
+            val chunkSize = if (chunkIdx == totalChunks - 1) lastChunkLen else payloadMtu
 
-            // 18-byte Header (sliceIdx=0, totalSlices=1 represents atomic frame):
+            // 18-byte Header:
             // 0..3: Frame Seq (uint32)
-            // 4: Slice Idx (uint8) = 0
+            // 4: Flags: bit 0 = isKeyFrame, bit 1 = isFecParity (0 here)
             // 5: Total Slices (uint8) = 1
             // 6..7: Chunk Idx (uint16)
             // 8..9: Total Chunks (uint16)
             // 10..17: Timestamp ms (uint64)
             writeInt(videoPacketBuffer, 0, frameSeqInt)
-            videoPacketBuffer[4] = 0.toByte()
+            videoPacketBuffer[4] = if (isKeyFrame) 1.toByte() else 0.toByte()
             videoPacketBuffer[5] = 1.toByte()
             writeShort(videoPacketBuffer, 6, chunkIdx.toShort())
             writeShort(videoPacketBuffer, 8, totalChunks.toShort())
@@ -879,11 +851,32 @@ class StreamingService : Service() {
                 packetsCount++
             } catch (_: Exception) {}
 
-            // 4G/5G subframe pacing: avoids dumping all chunks into modem buffer in single microsecond
-            if (totalChunks > 1 && chunkIdx < totalChunks - 1 && paceIntervalNs > 0) {
-                java.util.concurrent.locks.LockSupport.parkNanos(paceIntervalNs)
+            // Micro-pacing between multi-chunk frames: prevents cellular modem & router FIFO queue drops
+            if (totalChunks > 1) {
+                java.util.concurrent.locks.LockSupport.parkNanos(40_000L) // 40 microseconds
             }
         }
+
+        // Send 1-Packet XOR FEC Parity packet:
+        // Allows laptop receiver to instantly reconstruct any dropped packet with 0ms retransmission latency
+        val baseFlags = if (isKeyFrame) 1 else 0
+        val fecFlags = (baseFlags or 0x02).toByte()
+        writeInt(fecParityBuffer, 0, frameSeqInt)
+        fecParityBuffer[4] = fecFlags
+        fecParityBuffer[5] = 1.toByte()
+        writeShort(fecParityBuffer, 6, totalChunks.toShort()) // parity chunkIdx = totalChunks
+        writeShort(fecParityBuffer, 8, totalChunks.toShort())
+        writeLong(fecParityBuffer, 10, timestampMs)
+
+        // Store lastChunkLen (2 bytes) + parityData (payloadMtu bytes)
+        writeShort(fecParityBuffer, headerSize, lastChunkLen.toShort())
+        System.arraycopy(parityData, 0, fecParityBuffer, headerSize + 2, payloadMtu)
+
+        val parityPacket = DatagramPacket(fecParityBuffer, headerSize + 2 + payloadMtu, target.address, target.port)
+        try {
+            socket.send(parityPacket)
+            packetsCount++
+        } catch (_: Exception) {}
 
         return packetsCount
     }
@@ -929,6 +922,15 @@ class StreamingService : Service() {
     }
 
     private fun getBackCameraId(manager: CameraManager): String {
+        // ID "0" is the universal primary rear wide camera across Android
+        if (manager.cameraIdList.contains("0")) {
+            try {
+                val chars = manager.getCameraCharacteristics("0")
+                if (chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK) {
+                    return "0"
+                }
+            } catch (_: Exception) {}
+        }
         for (id in manager.cameraIdList) {
             val chars = manager.getCameraCharacteristics(id)
             val facing = chars.get(CameraCharacteristics.LENS_FACING)
